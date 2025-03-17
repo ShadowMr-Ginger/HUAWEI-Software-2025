@@ -5,6 +5,7 @@
 /////////////////  新增包含
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -25,7 +26,7 @@ vector<size_t> sort_indexes(const vector<T>& v) {
     return idx;
 }
 
-/////////////////  原始定义
+/////////////////  原始定义 
 #define MAX_DISK_NUM (10 + 1)
 #define MAX_DISK_SIZE (16384 + 1)
 #define MAX_REQUEST_NUM (30000000 + 1)
@@ -45,8 +46,10 @@ typedef struct Request_ {
 typedef struct Object_ {
     //int replica[REP_NUM + 1];
     int replica_disk[REP_NUM];
+    int replica_partition[REP_NUM];
+    bool replica_over_write[REP_NUM] = { false };
     //int* unit[REP_NUM + 1];
-    int start_unit[REP_NUM];
+    vector<int> store_units[REP_NUM];
     int size;
     int last_request_point;
     int tag;
@@ -72,6 +75,7 @@ struct Partition {
     bool reverse_write = false;
     bool unassigned = true;
     int init_pointer = 0;
+    int reverse_pointer = 0;
     bool full = false;
     Partition() {};
     Partition(int tag_, int sz_, int first_unit_, bool reverse_write_, bool unassigned_) {
@@ -86,6 +90,12 @@ struct Partition {
         }
         else {
             init_pointer = first_unit;
+        }
+        if (reverse_write) {
+            reverse_pointer = first_unit;
+        }
+        else {
+            reverse_pointer = last_unit;
         }
     }
 };
@@ -118,6 +128,10 @@ int disk_point[MAX_DISK_NUM];
 Request request[MAX_REQUEST_NUM];
 Object object[MAX_OBJECT_NUM];
 
+ifstream file("sample_practice.txt");
+bool debug_mode = true;
+int ts = 0;
+
 /////////////////  新增全局变量
 
 vector<vector<int>> fre_del;
@@ -134,8 +148,20 @@ vector<Disk> disks;
 void timestamp_action()
 {
     int timestamp;
-    scanf("%*s%d", &timestamp);
-    printf("TIMESTAMP %d\n", timestamp);
+    
+    ts++;
+    
+    if (debug_mode) {
+        string line;
+        getline(file, line);
+        printf("%s\n", line.c_str());
+    }
+    else {
+        scanf("%*s%d", &timestamp);
+        printf("TIMESTAMP %d\n", timestamp);
+    }
+    
+    
 
     fflush(stdout);
 }
@@ -153,69 +179,162 @@ void delete_action()
 {
     int n_delete;
     int abort_num = 0;
-    static int _id[MAX_OBJECT_NUM];
-
-    scanf("%d", &n_delete);
-    for (int i = 1; i <= n_delete; i++) {
-        scanf("%d", &_id[i]);
+    //读取当前ts删除操作的总数
+    if (debug_mode) {
+        string line;
+        getline(file, line);
+        stringstream ss(line);
+        ss >> n_delete;
+    }
+    else {
+        scanf("%d", &n_delete);
     }
 
     for (int i = 1; i <= n_delete; i++) {
-        int id = _id[i];
-        int current_id = object[id].last_request_point;
-        while (current_id != 0) {
-            if (request[current_id].is_done == false) {
-                abort_num++;
-            }
-            current_id = request[current_id].prev_id;
+        int id = 0;
+        // 读取删除对象的id
+        if (debug_mode) {
+            string line;
+            getline(file, line);
+            stringstream ss(line);
+            ss >> id;
         }
-    }
-
-    printf("%d\n", abort_num);
-    for (int i = 1; i <= n_delete; i++) {
-        int id = _id[i];
-        int current_id = object[id].last_request_point;
-        while (current_id != 0) {
-            if (request[current_id].is_done == false) {
-                printf("%d\n", current_id);
-            }
-            current_id = request[current_id].prev_id;
+        else{
+            scanf("%d", id);
         }
-        for (int j = 1; j <= REP_NUM; j++) {
-            //do_object_delete(object[id].unit[j], disk[object[id].replica[j]], object[id].size);
-        }
+        // 执行删除操作
         object[id].is_delete = true;
+
+        int size = object[id].size;
+        int tag = object[id].tag;
+        for (int i = 0; i < REP_NUM; i++) {
+            int rep_d = object[id].replica_disk[i];
+            int rep_p = object[id].replica_partition[i];
+            int rep_o = object[id].replica_over_write[i];
+
+            // 迁移初始指针
+            if (rep_o) {
+                if (disks[rep_d].partitions[rep_p].reverse_write) {
+                    if (disks[rep_d].partitions[rep_p].reverse_pointer> object[id].store_units[i][0]) {
+                        disks[rep_d].partitions[rep_p].reverse_pointer = object[id].store_units[i][0];
+                    }
+                }
+                else {
+                    if (disks[rep_d].partitions[rep_p].reverse_pointer < object[id].store_units[i][0]) {
+                        disks[rep_d].partitions[rep_p].reverse_pointer = object[id].store_units[i][0];
+                    }
+                }
+            }
+            else {
+                if (disks[rep_d].partitions[rep_p].reverse_write) {
+                    if (disks[rep_d].partitions[rep_p].init_pointer < object[id].store_units[i][0]) {
+                        disks[rep_d].partitions[rep_p].init_pointer = object[id].store_units[i][0];
+                    }
+                }
+                else {
+                    if (disks[rep_d].partitions[rep_p].init_pointer > object[id].store_units[i][0]) {
+                        disks[rep_d].partitions[rep_p].init_pointer = object[id].store_units[i][0];
+                    }
+                }
+            }
+            
+            // 释放unit
+            for (int j = 0; j < size; j++) {
+                int u = object[id].store_units[i][j];
+                disks[rep_d].unit_status[u] = 0;
+                disks[rep_d].spare_units += size;
+            }
+
+            // 更新partition状态
+            disks[rep_d].partitions[rep_p].full = false;
+        }
     }
 
-    fflush(stdout);
+
+    //int n_delete;
+    //int abort_num = 0;
+    //static int _id[MAX_OBJECT_NUM];
+    ////读取当前ts删除操作的总数
+    //scanf("%d", &n_delete);
+
+    //for (int i = 1; i <= n_delete; i++) {
+    //    scanf("%d", &_id[i]);
+    //}
+
+    //for (int i = 1; i <= n_delete; i++) {
+    //    int id = _id[i];
+    //    int current_id = object[id].last_request_point;
+    //    while (current_id != 0) {
+    //        if (request[current_id].is_done == false) {
+    //            abort_num++;
+    //        }
+    //        current_id = request[current_id].prev_id;
+    //    }
+    //}
+
+    //printf("%d\n", abort_num);
+    //for (int i = 1; i <= n_delete; i++) {
+    //    int id = _id[i];
+    //    int current_id = object[id].last_request_point;
+    //    while (current_id != 0) {
+    //        if (request[current_id].is_done == false) {
+    //            printf("%d\n", current_id);
+    //        }
+    //        current_id = request[current_id].prev_id;
+    //    }
+    //    for (int j = 1; j <= REP_NUM; j++) {
+    //        //do_object_delete(object[id].unit[j], disk[object[id].replica[j]], object[id].size);
+    //    }
+    //    object[id].is_delete = true;
+    //}
+    //
+    //fflush(stdout);
 }
 
 //对象写入步
-void do_object_write(int* object_unit, int* disk_unit, int size, int object_id)
-{
-    int current_write_point = 0;
-    for (int i = 1; i <= V; i++) {
-        if (disk_unit[i] == 0) {
-            disk_unit[i] = object_id;
-            object_unit[++current_write_point] = i;
-            if (current_write_point == size) {
-                break;
-            }
-        }
-    }
-
-    assert(current_write_point == size);
-}
+//void do_object_write(int* object_unit, int* disk_unit, int size, int object_id)
+//{
+//    int current_write_point = 0;
+//    for (int i = 1; i <= V; i++) {
+//        if (disk_unit[i] == 0) {
+//            disk_unit[i] = object_id;
+//            object_unit[++current_write_point] = i;
+//            if (current_write_point == size) {
+//                break;
+//            }
+//        }
+//    }
+//
+//    assert(current_write_point == size);
+//}
 
 //对象写入操作
 void write_action()
 {
     int n_write;
-    scanf("%d", &n_write);
+    if (debug_mode) {
+        string line;
+        getline(file, line);
+        stringstream ss(line);
+        ss >> n_write;
+    }
+    else {
+        scanf("%d", &n_write);
+    }
+
     for (int i = 1; i <= n_write; i++) {
         //读取写入信息
         int id, size, tag;
-        scanf("%d%d%d", &id, &size, &tag);
+        if (debug_mode) {
+            string line;
+            getline(file, line);
+            stringstream ss(line);
+            ss >> id >> size >> tag;
+        }
+        else {
+            scanf("%d%d%d", &id, &size, &tag);
+        }
+        
         //存储到object
         object[id].last_request_point = 0;
         object[id].size = size;
@@ -243,6 +362,9 @@ void write_action()
                 if (disks[choose_disk].partitions[*k].reverse_write) {
                     //倒写存储
                     for (int u = disks[choose_disk].partitions[*k].init_pointer; u >= start_unit; u--) {
+                        if (u - size + 1 < start_unit) {
+                            break;
+                        }
                         if (disks[choose_disk].unit_status[u] == 0) {
                             bool can_store = true;
                             for (int v = 0; v < size; v++) {
@@ -254,15 +376,19 @@ void write_action()
                             if (can_store) {
                                 //可以存储
                                 success_stored = true;
-                                object[id].replica_disk[store_rep] = *k;
-                                object[id].start_unit[store_rep] = u - size + 1;
-                                for (int v = u - size + 1; v < u + 1; v++) {
+                                object[id].replica_disk[store_rep] = choose_disk;
+                                object[id].replica_partition[store_rep] = *k;
+                                object[id].replica_over_write[store_rep] = false;
+                                object[id].store_units[store_rep].resize(size);
+                                int iter = 0;
+                                for (int v = u; v > u - size; v--) {
                                     disks[choose_disk].unit_status[v] = tag;
+                                    object[id].store_units[store_rep][iter] = v;
+                                    iter++;
                                 }
                                 disks[choose_disk].spare_units -= size;
                                 store_rep++;
                                 //更新写盘指针位置
-                                disks[choose_disk].partitions[*k].init_pointer -= size;
                                 while (disks[choose_disk].unit_status[disks[choose_disk].partitions[*k].init_pointer] != 0) {
                                     disks[choose_disk].partitions[*k].init_pointer--;
                                     if (disks[choose_disk].partitions[*k].init_pointer < disks[choose_disk].partitions[*k].first_unit) {
@@ -278,6 +404,9 @@ void write_action()
                 else {
                     //顺写存储
                     for (int u = disks[choose_disk].partitions[*k].init_pointer; u <= last_unit; u++) {
+                        if (u + size - 1 > last_unit) {
+                            break;
+                        }
                         if (disks[choose_disk].unit_status[u] == 0) {
                             bool can_store = true;
                             for (int v = 0; v < size; v++) {
@@ -289,15 +418,19 @@ void write_action()
                             if (can_store) {
                                 //可以存储
                                 success_stored = true;
-                                object[id].replica_disk[store_rep] = *k;
-                                object[id].start_unit[store_rep] = u;
+                                object[id].replica_disk[store_rep] = choose_disk;
+                                object[id].replica_partition[store_rep] = *k;
+                                object[id].replica_over_write[store_rep] = false;
+                                object[id].store_units[store_rep].resize(size);
+                                int iter = 0;
                                 for (int v = u; v < u + size; v++) {
                                     disks[choose_disk].unit_status[v] = tag;
+                                    object[id].store_units[store_rep][iter] = v;
+                                    iter++;
                                 }
                                 disks[choose_disk].spare_units -= size;
                                 store_rep++;
                                 //更新写盘指针位置
-                                disks[choose_disk].partitions[*k].init_pointer += size;
                                 while (disks[choose_disk].unit_status[disks[choose_disk].partitions[*k].init_pointer] != 0) {
                                     disks[choose_disk].partitions[*k].init_pointer++;
                                     if (disks[choose_disk].partitions[*k].init_pointer > disks[choose_disk].partitions[*k].last_unit) {
@@ -314,16 +447,179 @@ void write_action()
                     break;
                 }
             }
-            
+
             if (store_rep == store_requirement) {
                 break;
             }
         }
 
-        if (store_rep <= store_requirement) {
-            // 未能完成需要的备份数量时，占用规划范围外的内存。
+        // 未能完成需要的备份数量时，占用规划范围外的内存。
+        if (store_rep < store_requirement) {
+            for (int n = 0; n < N; n++) {
+                int choose_disk = disk_iter_sequence[n];
+                bool success_stored = false;//用于记录是否顺利存储
+                for (auto k = disks[choose_disk].tag_sequence[tag].begin(); k != disks[choose_disk].tag_sequence[tag].end(); k++) {
+                    int choose_partition = *k;
+                    if (disks[choose_disk].partitions[choose_partition].reverse_write) {
+                        choose_partition--;
+                    }
+                    else {
+                        choose_partition++;
+                    }
+                    if (disks[choose_disk].partitions[choose_partition].full){
+                        continue;
+                    }
+                    if (disks[choose_disk].partitions[choose_partition].unassigned) {
+                        continue;
+                    }
+                    int start_unit = disks[choose_disk].partitions[choose_partition].first_unit;
+                    int last_unit = disks[choose_disk].partitions[choose_partition].last_unit;
+                    if (disks[choose_disk].partitions[choose_partition].reverse_write) {
+                        //顺写存储
+                        for (int u = disks[choose_disk].partitions[choose_partition].reverse_pointer; u <= last_unit; u++) {
+                            if (u + size - 1 > last_unit) {
+                                break;
+                            }
+                            if (disks[choose_disk].unit_status[u] == 0) {
+                                bool can_store = true;
+                                for (int v = 0; v < size; v++) {
+                                    if (disks[choose_disk].unit_status[u + v] != 0) {
+                                        can_store = false;
+                                        break;
+                                    }
+                                }
+                                if (can_store) {
+                                    //可以存储
+                                    success_stored = true;
+                                    object[id].replica_disk[store_rep] = choose_disk;
+                                    object[id].replica_partition[store_rep] = choose_partition;
+                                    object[id].replica_over_write[store_rep] = true;
+                                    object[id].store_units[store_rep].resize(size);
+                                    int iter = 0;
+                                    for (int v = u; v < u + size; v++) {
+                                        disks[choose_disk].unit_status[v] = tag;
+                                        object[id].store_units[store_rep][iter] = v;
+                                        iter++;
+                                    }
+                                    disks[choose_disk].spare_units -= size;
+                                    store_rep++;
+                                    //更新写盘指针位置
+                                    while (disks[choose_disk].unit_status[disks[choose_disk].partitions[choose_partition].reverse_pointer] != 0) {
+                                        disks[choose_disk].partitions[choose_partition].reverse_pointer++;
+                                        if (disks[choose_disk].partitions[choose_partition].reverse_pointer > disks[choose_disk].partitions[choose_partition].last_unit) {
+                                            disks[choose_disk].partitions[choose_partition].full = true;
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        //倒写存储
+                        for (int u = disks[choose_disk].partitions[choose_partition].reverse_pointer; u >= start_unit; u++) {
+                            if (u - size + 1 < start_unit) {
+                                break;
+                            }
+                            if (disks[choose_disk].unit_status[u] == 0) {
+                                bool can_store = true;
+                                for (int v = 0; v < size; v++) {
+                                    if (disks[choose_disk].unit_status[u - v] != 0) {
+                                        can_store = false;
+                                        break;
+                                    }
+                                }
+                                if (can_store) {
+                                    //可以存储
+                                    success_stored = true;
+                                    object[id].replica_disk[store_rep] = choose_disk;
+                                    object[id].replica_partition[store_rep] = choose_partition;
+                                    object[id].replica_over_write[store_rep] = true;
+                                    object[id].store_units[store_rep].resize(size);
+                                    int iter = 0;
+                                    for (int v = u; v > u - size; v--) {
+                                        disks[choose_disk].unit_status[v] = tag;
+                                        object[id].store_units[store_rep][iter] = v;
+                                        iter++;
+                                    }
+                                    disks[choose_disk].spare_units -= size;
+                                    store_rep++;
+                                    //更新写盘指针位置
+                                    while (disks[choose_disk].unit_status[disks[choose_disk].partitions[choose_partition].reverse_pointer] != 0) {
+                                        disks[choose_disk].partitions[choose_partition].reverse_pointer--;
+                                        if (disks[choose_disk].partitions[choose_partition].reverse_pointer < disks[choose_disk].partitions[choose_partition].first_unit) {
+                                            disks[choose_disk].partitions[choose_partition].full = true;
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (success_stored) {
+                        break;
+                    }
+                }
+                if (store_rep == store_requirement) {
+                    break;
+                }
+            }
         }
 
+        // 若仍未完成需要的备份数量，则占用未分配的分区
+        if (store_rep < store_requirement) {
+            for (int n = 0; n < N; n++) {
+                int choose_disk = disk_iter_sequence[n];
+                bool success_stored = false;//用于记录是否顺利存储
+                int last_unit = disks[choose_disk].partitions[0].last_unit;
+                if (disks[choose_disk].partitions[0].full) {
+                    continue;
+                }
+
+                for (int u = disks[choose_disk].partitions[0].init_pointer; u <= last_unit; u++) {
+                    if (u + size - 1 > last_unit) {
+                        break;
+                    }
+                    bool can_store = true;
+                    for (int v = 0; v < size; v++) {
+                        if (disks[choose_disk].unit_status[u + v] != 0) {
+                            can_store = false;
+                            break;
+                        }
+                    }
+                    if (can_store) {
+                        //可以存储
+                        success_stored = true;
+                        object[id].replica_disk[store_rep] = choose_disk;
+                        object[id].replica_partition[store_rep] = 0;
+                        object[id].replica_over_write[store_rep] = false;
+                        object[id].store_units[store_rep].resize(size);
+                        int iter = 0;
+                        for (int v = u; v < u + size; v++) {
+                            disks[choose_disk].unit_status[v] = tag;
+                            object[id].store_units[store_rep][iter] = v;
+                            iter++;
+                        }
+                        disks[choose_disk].spare_units -= size;
+                        store_rep++;
+                        //更新写盘指针位置
+                        while (disks[choose_disk].unit_status[disks[choose_disk].partitions[0].init_pointer] != 0) {
+                            disks[choose_disk].partitions[0].reverse_pointer++;
+                            if (disks[choose_disk].partitions[0].reverse_pointer > disks[choose_disk].partitions[0].last_unit) {
+                                disks[choose_disk].partitions[0].full = true;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                if (store_rep == store_requirement) {
+                    break;
+                }
+            }
+        }
         //for (int j = 1; j <= REP_NUM; j++) {
 
         //    object[id].replica[j] = (id + j) % N + 1;
@@ -333,14 +629,14 @@ void write_action()
         //    do_object_write(object[id].unit[j], disk[object[id].replica[j]], size, id);
         //}
 
-        //printf("%d\n", id);
-        //for (int j = 1; j <= REP_NUM; j++) {
-        //    printf("%d", object[id].replica[j]);
-        //    for (int k = 1; k <= size; k++) {
-        //        printf(" %d", object[id].unit[j][k]);
-        //    }
-        //    printf("\n");
-        //}
+        printf("%d\n", id);
+        for (int j = 0; j < REP_NUM; j++) {
+            printf("%d", object[id].replica_disk[j] + 1);
+            for (int k = 0; k < size; k++) {
+                printf(" %d", object[id].store_units[j][k] + 1);
+            }
+            printf("\n");
+        }
     }
 
     fflush(stdout);
@@ -349,16 +645,33 @@ void write_action()
 //对象读取操作
 void read_action()
 {
-    //int n_read;
-    //int request_id, object_id;
-    //scanf("%d", &n_read);
-    //for (int i = 1; i <= n_read; i++) {
-    //    scanf("%d%d", &request_id, &object_id);
-    //    request[request_id].object_id = object_id;
-    //    request[request_id].prev_id = object[object_id].last_request_point;
-    //    object[object_id].last_request_point = request_id;
-    //    request[request_id].is_done = false;
-    //}
+    int n_read;
+    if (debug_mode) {
+        string line;
+        getline(file, line);
+        stringstream ss(line);
+        ss >> n_read;
+    }
+    else {
+        scanf("%d", &n_read);
+    }
+
+    int request_id, object_id;
+    for (int i = 1; i <= n_read; i++) {
+        if (debug_mode) {
+            string line;
+            getline(file, line);
+            stringstream ss(line);
+            ss >> request_id >> object_id;
+        }
+        else {
+            scanf("%d%d", &request_id, &object_id);
+        }
+        request[request_id].object_id = object_id;
+        request[request_id].prev_id = object[object_id].last_request_point;
+        object[object_id].last_request_point = request_id;
+        request[request_id].is_done = false;
+    }
 
     //static int current_request = 0;
     //static int current_phase = 0;
@@ -424,7 +737,16 @@ void clean()
 // 初始化读取+预处理
 void initialize()
 {
-    scanf("%d%d%d%d%d", &T, &M, &N, &V, &G);
+    if (debug_mode) {
+        string line;
+        getline(file, line);
+        stringstream ss(line);
+        ss >> T >> M >> N >> V >> G;
+    }
+    else {
+        scanf("%d%d%d%d%d", &T, &M, &N, &V, &G);
+    }
+
 
     // 初始化硬盘信息
     for (int i = 0; i < N; i++) {
@@ -442,21 +764,51 @@ void initialize()
         fre_read[i].resize(section_number);
     }
 
-    for (int i = 1; i <= M; i++) {
-        for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
-            scanf("%d", &fre_del[i - 1][j - 1]);
+    if (debug_mode) {
+        for (int i = 1; i <= M; i++) {
+            string line;
+            getline(file, line);
+            stringstream ss(line);
+            for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
+                ss >> fre_del[i - 1][j - 1];
+            }
+        }
+
+        for (int i = 1; i <= M; i++) {
+            string line;
+            getline(file, line);
+            stringstream ss(line);
+            for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
+                ss >> fre_write[i - 1][j - 1];
+            }
+        }
+
+        for (int i = 1; i <= M; i++) {
+            string line;
+            getline(file, line);
+            stringstream ss(line);
+            for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
+                ss >> fre_read[i - 1][j - 1];
+            }
         }
     }
-
-    for (int i = 1; i <= M; i++) {
-        for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
-            scanf("%d", &fre_write[i - 1][j - 1]);
+    else {
+        for (int i = 1; i <= M; i++) {
+            for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
+                scanf("%d", &fre_del[i - 1][j - 1]);
+            }
         }
-    }
 
-    for (int i = 1; i <= M; i++) {
-        for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
-            scanf("%d", &fre_read[i - 1][j - 1]);
+        for (int i = 1; i <= M; i++) {
+            for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
+                scanf("%d", &fre_write[i - 1][j - 1]);
+            }
+        }
+
+        for (int i = 1; i <= M; i++) {
+            for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
+                scanf("%d", &fre_read[i - 1][j - 1]);
+            }
         }
     }
 
@@ -524,23 +876,23 @@ void disk_pre_allocation(float unassigned_rate, int part_number)
             random_shuffle(tag_more.begin(), tag_more.end());
             for (size_t k = 0; k < tag_less.size(); k++) {
                 int tag = tag_more[k];
-                int sz = part_memory*tag_memory_rate[tag_more[k]]+1;
+                int sz = part_memory * tag_memory_rate[tag_more[k] - 1] + 1;
                 Partition part1 = Partition(tag, sz, first_unit, false, false);
                 disks[i].partitions.push_back(part1);
-                disks[i].tag_sequence[tag].push_back(int(disks[i].partitions.size()));
+                disks[i].tag_sequence[tag].push_back(int(disks[i].partitions.size())-1);
                 first_unit += sz;
                 surplus_memory -= sz;
                 tag = tag_less[k];
-                sz = part_memory * tag_memory_rate[tag_less[k]] + 1;
+                sz = part_memory * tag_memory_rate[tag_less[k] - 1] + 1;
                 Partition part2 = Partition(tag, sz, first_unit, true, false);
                 disks[i].partitions.push_back(part2);
-                disks[i].tag_sequence[tag].push_back(int(disks[i].partitions.size()));
+                disks[i].tag_sequence[tag].push_back(int(disks[i].partitions.size())-1);
                 first_unit += sz;
                 surplus_memory -= sz;
             }
             if (M % 2) {
                 int tag = sort_idx_tag_memory[M/2];
-                int sz = part_memory * tag_memory_rate[tag_more[M/2]] + 1;
+                int sz = part_memory * tag_memory_rate[tag_more[M / 2] - 1] + 1;
                 Partition part1 = Partition(tag, sz, first_unit, false, false);
                 disks[i].partitions.push_back(part1);
                 disks[i].tag_sequence[tag].push_back(int(disks[i].partitions.size()));
@@ -552,6 +904,8 @@ void disk_pre_allocation(float unassigned_rate, int part_number)
         disks[i].partitions[0].sz = surplus_memory;
         disks[i].partitions[0].first_unit = first_unit;
         disks[i].partitions[0].last_unit = V - 1;
+        disks[i].partitions[0].init_pointer = first_unit;
+        disks[i].partitions[0].reverse_pointer = V - 1;
     }
 
     //// 取一部分用于容错的存储空间，不进行分配
@@ -613,7 +967,7 @@ int main()
     for (int t = 1; t <= T + EXTRA_TIME; t++) {
         
         timestamp_action();//时间片对齐
-        
+
         delete_action();//对象删除
 
         write_action();//对象写入
