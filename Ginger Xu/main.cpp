@@ -14,6 +14,7 @@
 #include <numeric>
 #include <cmath>
 #include <climits>
+#include <queue>
 
 using namespace std;
 #pragma endregion
@@ -26,21 +27,71 @@ int ts = 0;
 /////////////////////////////////////////////////////// 算法可调参数
 float jump_req_num_rate = 0.5;
 double randseed = 666; // 随机种子
-double num_unfi_req_unit_rate_for_continuous_read = 0.35; // 进行连续读取所需要的任务unit比例
-double no_tag_rate = 0.05; // 无tag区的size
+
+double no_tag_rate = 0.05; // 无tag区的size_rate
+int urgent_request_ts = 95; // 超过urgent_request_ts仍未被上报的任务，标记紧急上报
+int tag_on_heat_period_threshold = 10000; // 判断tag在某一个period是否on_heat 的请求数量阈值
+double unfi_req_unit_rate_for_continuous_read = 0.38; // 进行连续读取所需要的任务unit比例
+//double threshold_rate_of_reqU_for_continuous_read = 0.38; // 一个part需要连续read的req_u比例
+double actual_process_unit_rate = 0.90; // 可以处理的unit占最大可处理unit的比例
+
+
+// ReadingLoop 部分的可调参数
+// 算法外设参数：接受增加part的分数阈值
+double accept_add_value_threshold = 0.0;
+// 算法外设参数：接受删除part的分数阈值
+double accept_cancel_value_threshold = 0;
+double accept_exchange_value_threshold = 30;
+
+////////////////////////a* search部分的可调参数
+// 算法外设参数：扫描倍数因子
+int scan_mutiple_factor = 10;
+// 算法外设参数：取消请求的惩罚因子
+double cancellation_penalty_factor = 0.8;
+// 算法外设参数：取消请求的门槛
+double cancellation_req_ratio_threshold = 1.0;
+// 算法外设参数：token向score的转化率
+double token_score_transfer_rate = 1.0;
+// 算法外设参数：A* search 剪枝系数
+double cut_twig_factor = 1.2;
+// 算法外设参数：A* search 搜索深度
+int search_depth = 40;
 
 /////////////////  前置工具函数
 #pragma region ToolFunction
 //排序vector返回索引函数
 template <typename T>
-vector<size_t> sort_indexes(const vector<T>& v) {
-    // 初始化索引向量
-    vector<size_t> idx(v.size());
-    //使用iota对向量赋0~？的连续值
-    iota(idx.begin(), idx.end(), 0);
-    // 通过比较v的值对索引idx进行排序
-    sort(idx.begin(), idx.end(), [&v](size_t i1, size_t i2) { return v[i1] < v[i2]; });
+std::vector<size_t> sort_indexes(const std::vector<T>& v, bool ascending = true) {
+    std::vector<size_t> idx(v.size());
+    std::iota(idx.begin(), idx.end(), 0);
+    if (ascending) {
+        std::sort(idx.begin(), idx.end(),
+            [&v](size_t i1, size_t i2) { return v[i1] < v[i2]; });
+    }
+    else {
+        std::sort(idx.begin(), idx.end(),
+            [&v](size_t i1, size_t i2) { return v[i1] > v[i2]; });
+    }
     return idx;
+}
+
+template <typename T>
+auto sum_vector(const std::vector<T>& v) -> T {
+    return std::accumulate(v.begin(), v.end(), T{ 0 });
+}
+
+// 返回最大值的索引
+template <typename T>
+size_t index_of_max(const vector<T>& v) {
+    if (v.empty()) throw invalid_argument("Vector is empty");
+    return distance(v.begin(), max_element(v.begin(), v.end()));
+}
+
+// 返回最小值的索引
+template <typename T>
+size_t index_of_min(const vector<T>& v) {
+    if (v.empty()) throw invalid_argument("Vector is empty");
+    return std::distance(v.begin(), min_element(v.begin(), v.end()));
 }
 
 // 找到vector中的最大值以及其索引
@@ -82,7 +133,7 @@ double calculateVariance(const std::vector<double>& data) {
 #define REP_NUM (3)
 #define FRE_PER_SLICING (1800)
 #define EXTRA_TIME (105)
-
+#define DISK_HEAD_NUM (2)
 #define MAX_OBJECT_SIZE (5) //新增
 
 /////////////////  原始全局变量
@@ -100,7 +151,6 @@ typedef struct Request_ {
     int arrival_ts;
     bool have_read[MAX_OBJECT_SIZE] = { false }; //新增
     bool is_done = false;
-    bool lose_value = false;
 } Request;
 
 typedef struct Object_ {
@@ -116,15 +166,12 @@ typedef struct Object_ {
     bool is_delete = false;
     bool is_wasted = false;
     int last_req_ts = -1;
+    bool is_urgent = false;
 } Object;
-
-
 
 
 Request request[MAX_REQUEST_NUM];
 Object object[MAX_OBJECT_NUM];
-
-
 
 
 /////////////////  新增定义
@@ -143,6 +190,7 @@ struct Unit {
     int nxt_unit_id = 0; // 该单元下一个unit号
     int number_unfi_req = 0; // 该单元所存储的未完成的请求数量
     int partition_id = 0;
+    bool is_urgent = false;
 
     Unit() {
         for (int i = 0; i < REP_NUM - 1; i++) {
@@ -156,7 +204,8 @@ struct Partition {
     //磁盘的子区
     int tag = 0;
     int sz = 0;
-    int occupied_u_number = 0;
+
+    //vector<int> occupied_tag_u_number;
     int first_unit = -1;
     int last_unit = -1;
     bool reverse_write = false;
@@ -165,6 +214,38 @@ struct Partition {
     int reverse_pointer = 0;
     bool full = false;
     int num_req = 0;
+    double req_rho = 0.0;
+    bool is_urgent = false;
+
+    int req_u_number = 0;    //  part存在的未被读取的unit数量
+    int accept_status = 2;  // 2 表示可以无限接取  1 表示可在现有req的obj上接取  0 表示不可接取  3 待定
+    bool on_reading = false; // 记录该part是否正在被读取
+    int finish_reading_surplus_ts = 0; //记录该part还需要几个ts读取完
+
+    vector<int> num_tag_units;
+    vector<int> num_current_tag_req;
+    vector<double> tag_u_avg_req;
+    vector<double> score_for_statuses;
+    vector<int> process_u_require_for_statuses;
+    int occupied_u_number = 0;
+    
+    double actual_req_u_rate = 0;
+
+    /// <summary>
+    /// 最新算法的参数
+    /// </summary>
+    double num_following_105_ts_requests = 0.0;
+    double estimating_ts_for_reading = 0.0;
+    double estimating_ts_ratio_for_reading = 0.0;
+    double requests_time_ratio = 0.0;
+    bool is_chosen = false;
+    double num_u_with_req = 0.0;
+
+    bool can_accept_new_req = true;
+    /// <summary>
+    /// 最新算法的参数
+    /// </summary>
+
     bool on_heat = false; // 该子区是否为被主要读取的对象
     int rep_disk_id[REP_NUM - 1] = { 0 }; // 该单元存储object的其他replica所在磁盘编号
     int rep_part_id[REP_NUM - 1] = { 0 }; // 该单元存储object的其他replica所在磁盘unit号
@@ -188,6 +269,62 @@ struct Partition {
         else {
             reverse_pointer = last_unit;
         }
+        num_tag_units.resize(Num_Tags);
+        num_current_tag_req.resize(Num_Tags);
+        tag_u_avg_req.resize(Num_Tags);
+        score_for_statuses.resize(3);
+        process_u_require_for_statuses.resize(3);
+    }
+};
+
+struct ReadingLoop {
+
+    int loop_sz = 0;
+    vector<int> part_sequence;
+    vector<double> part_num_105ts_req;
+    double total_num_105ts_req = 0.0;
+    vector<double> part_ts_ratio;
+    double total_ts_ratio = 0.0;
+
+};
+
+struct DiskHead {
+    int pointer_location = 1; // 磁盘pointer当前所在的unit
+    int current_partition = 0; //  记录pointer当前所在磁盘part
+    bool execute_jump = false;  // 是否需要执行jump
+    int jump_unit = 0;  // jump的目标unit
+    string action_flow = ""; // 执行动作流
+    /// <用于记录disk指针运动规划的变量>
+    vector<int> read_plan; // 记录执行read的位置
+    vector<int> read_obj; // 对应read_plan，记录read的object
+    vector<int> read_phase; // 记录read_plan结束的位置
+    int read_plan_pointer = 0; // 记录一个read_plan当中read的次数
+    int plan_over_mark = 0;// 记录action_flow_plan
+
+    int urgency_level = 0; // 记录磁盘头当前执行任务的紧急程度  0为较低（不在 hot part） 1为正常（在 hot part） 2为较高（在 urgent part）
+
+    ////////
+    // 新算法部分
+    ////////
+
+    ReadingLoop readingloop;
+    int current_task_part = 0;//  记录磁盘头当前正在处理的磁盘part
+    bool mission_started = false;
+    bool cancel_current_part = false;
+    bool exchange_current_part = false;
+    int exchange_part = 0;
+
+    bool  currently_free = true;
+    ////////
+    // 新算法部分
+    ////////
+
+    /// </用于记录disk指针运动规划的变量>
+    DiskHead(int max_continuous_read) {
+        action_flow.reserve(Num_Tokens + 2);
+        read_plan.resize(max_continuous_read * DISK_HEAD_NUM);
+        read_obj.resize(max_continuous_read * DISK_HEAD_NUM);
+        read_phase.resize(max_continuous_read * DISK_HEAD_NUM);
     }
 };
 
@@ -197,50 +334,66 @@ struct Disk {
 
     vector<Unit> units; // 单元
 
-    int pointer_location = 0; // 磁盘pointer当前所在的unit
+    vector<DiskHead> diskheads;
 
-    bool execute_jump = false;  // 是否需要执行jump
+    vector<bool> part_activated;
 
-    int jump_unit = 0;  // jump的目标unit
+    bool same_loop = true;
 
-    string action_flow = ""; // 执行动作留
-
-    int num_spare_units = 0; //指针是否正空闲
-
-
-    /// <用于记录disk指针运动规划的变量>
-    vector<int> read_plan; // 记录执行read的位置
-    vector<int> read_obj; // 对应read_plan，记录read的object
-    vector<int> read_phase; // 记录read_plan
-    int read_plan_pointer = 0; // 记录一个read_plan当中read的次数
-    int plan_over_mark = 0;// 记录action_flow_plan结束的位置
-    /// </用于记录disk指针运动规划的变量>
+    int num_spare_units = 0; //空闲unit数量
 
     Disk() {};
     Disk(int capacity, int max_continuous_read) {
         partitions.resize(1);
         units.resize(capacity + 1);
         num_spare_units = capacity;
-        pointer_location = 1;
+
         for (int i = 1; i < capacity; i++) {
             units[i].nxt_unit_id = i + 1;
         }
         units[capacity].nxt_unit_id = 1;
         units[0].occupied = true;
 
-        read_plan.resize(max_continuous_read);
-        read_obj.resize(max_continuous_read);
-        read_phase.resize(max_continuous_read);
-
+        for (int i = 0; i < DISK_HEAD_NUM; i++) {
+            DiskHead dh = DiskHead(max_continuous_read);
+            diskheads.push_back(dh);
+        }
     }
 };
 
 struct Tag_To_Partition {
     // 用于记录一个tag存储于哪些partition
-    vector<int> disk_list;
+    //vector<int> disk_list;
     vector<int> partition_list;
     vector<int> over_write_partition_list;
 };
+
+struct Partition_Evaluator {
+    int d;
+    int p;
+    vector<double> score_for_statuses;
+    vector<int> process_u_require_for_statuses;
+
+    Partition_Evaluator(int d_, int p_) {
+        d = d_;
+        p = p_;
+        score_for_statuses.resize(3);
+        process_u_require_for_statuses.resize(3);
+    }
+};
+
+
+struct Score_Range {
+    int start_u = 0;
+    int len = 0;
+    double score_per_u = 0;
+    int distance_from_last_range = 0;
+    bool lower_than_avg = false;
+};
+
+
+
+
 
 #pragma endregion
 
@@ -252,10 +405,12 @@ struct Tag_To_Partition {
 
 vector<Disk> disks;
 vector<Tag_To_Partition> tag_to_partition;
+vector<Partition_Evaluator> partition_evaluator;
 vector<int> require_token; // 记录连续读取的token消耗
 vector<int> require_token_accumulated;
 int max_continuous_read = 0;
 int min_pass_read = 0;
+double can_read_unit_per_token = 0.0;
 
 vector<double>request_sz_unit_value; // 记录不同size的request每个unit的分数
 vector<double>request_sz_unit_value_ts_loss; // 记录不同size的request每个unit的分数 平均每个ts损失多少分数
@@ -278,8 +433,207 @@ int finished_request_pt = 0;
 
 string output_cache;
 
+// 用于记录输出繁忙的任务
+vector<int> busy_requests;
+int n_busy = 0;
+
 // 用于记录每个period，每个tag的读取是否on_heat
 vector<vector<bool>> tag_on_heat;
+
+// 用来记录urgent_req
+int urgent_loop_pt = -1;
+vector<vector<int>> urgent_req_loop;
+vector<int> urgent_req_pt;
+
+vector<int>urgent_obj_list;
+int urgent_obj_list_pt = 0;
+
+// 用来记录tag在当前ts是否on heat
+vector<bool> currently_tag_on_heat;
+vector<bool> currently_tag_ignore;
+int max_can_process_unit_in_time = 0;
+vector<int> currently_tag_unfi_req;
+
+// 记录每个disk有多少part是原始非replica的part
+int num_total_tag_part;
+
+// 用来记录tag在150ts内的请求总量变化值  用来计算tag req 趋势
+vector<vector<int>> last_150_ts_tag_req;
+int current_pt = 0;
+int last_50_pt = 100;
+int last_100_pt = 50;
+vector<double> avg_last_0_50_req;
+vector<double> avg_last_50_100_req;
+vector<double> avg_last_100_150_req;
+vector<double> current_avg_ts_req_slope;
+vector<double> next_105_tag_req;
+vector<double> next_105_tag_req_per_unit;
+vector<int> num_tag_unit;
+vector<int> num_tag_object;
+vector<double> tag_u_avg_req_next_105_ts;
+
+
+struct Node {
+    int current_step = 0; // 当前步
+    int current_step_read_u = 0;
+    int last_action = -1; // 取值0代表上一步是 pass and cancel，取值1代表上一步是 pass and read，取值2代表上一步是continuous read
+    int surplus_token = 0; // 当前剩余token
+    int current_continuous_read_num = 0;
+    vector<int> history_actions;
+    double current_score = 0.0;
+    double actual_score = 0.0;
+    bool endnode = false;
+    Node() {
+        history_actions.reserve(100);
+    }
+    Node(int _surplus_token) {
+        surplus_token = _surplus_token;
+    }
+    //下面这个重载，用于直接计算next node 的score
+    Node(Node last_node, int current_action, vector<Score_Range> score_ranges, int d, double avg_req_u) {
+        history_actions.reserve(100);
+        endnode = false;
+        int s = last_node.current_step;
+        surplus_token = last_node.surplus_token;
+        current_continuous_read_num = last_node.current_continuous_read_num;
+        if (current_action == 2) {
+            // 先c_r抵达该step的第一个u
+            for (int i = 0; i < score_ranges[s].distance_from_last_range; i++) {
+                if (surplus_token - require_token[current_continuous_read_num] >= 0) {
+                    surplus_token -= require_token[current_continuous_read_num];
+                    current_continuous_read_num++;
+                }
+                else {
+                    endnode = true;
+                    break;
+                }
+            }
+            if (!endnode) {
+                if (surplus_token - require_token[current_continuous_read_num] < 0) {
+                    endnode = true;
+                }
+            }
+        }else if (current_action == 1){
+            // 先pass抵达该step的第一个u
+            if (score_ranges[s].distance_from_last_range != 0) {
+                current_continuous_read_num = 0;
+                if (surplus_token < score_ranges[s].distance_from_last_range) {
+                    endnode = true;
+                }
+                else {
+                    surplus_token -= score_ranges[s].distance_from_last_range;
+                }
+            }
+            if (!endnode) {
+                if (surplus_token - require_token[current_continuous_read_num] < 0) {
+                    endnode = true;
+                }
+            }
+        }
+        
+        
+        if (!endnode) {
+            current_step = last_node.current_step + 1;
+            last_action = current_action;
+            history_actions = last_node.history_actions;
+            history_actions.push_back(last_node.last_action);
+            
+            actual_score = last_node.actual_score;
+            current_step_read_u = 0;
+
+
+            // 首先考虑下一步为 continuous_read
+
+            if (current_action == 2) {
+                // 然后c_r 该step
+                int current_step_u_num = score_ranges[s].len;
+                int u = score_ranges[s].start_u;
+                for (int i = 0; i < current_step_u_num; i++) {
+                    if (surplus_token - require_token[current_continuous_read_num] >= 0) {
+                        surplus_token -= require_token[current_continuous_read_num];
+                        current_continuous_read_num++;
+                        actual_score += disks[d].units[u].number_unfi_req;
+                        current_step_read_u++;
+                    }
+                    else {
+                        endnode = true;
+                        break;
+                    }
+                }
+                current_score = actual_score + avg_req_u * can_read_unit_per_token * surplus_token * token_score_transfer_rate;
+            }
+            //  接下来考虑下一步为 pass_read
+            else if (current_action == 1) {
+                // 然后c_r 该step
+                int current_step_u_num = score_ranges[s].len;
+                int u = score_ranges[s].start_u;
+                for (int i = 0; i < current_step_u_num; i++) {
+                    if (surplus_token - require_token[current_continuous_read_num] >= 0) {
+                        surplus_token -= require_token[current_continuous_read_num];
+                        current_continuous_read_num++;
+                        actual_score += disks[d].units[u].number_unfi_req;
+                        current_step_read_u++;
+                    }
+                    else {
+                        endnode = true;
+                        break;
+                    }
+                }
+                current_score = actual_score + avg_req_u * can_read_unit_per_token * surplus_token * token_score_transfer_rate;
+            }
+            // 最后考虑下一步为cancel
+            else {
+                // 先pass抵达该step的第一个u
+                if (score_ranges[s].distance_from_last_range != 0) {
+                    current_continuous_read_num = 0;
+                    if (surplus_token < score_ranges[s].distance_from_last_range) {
+                        endnode = true;
+                    }
+                    else {
+                        surplus_token -= score_ranges[s].distance_from_last_range;
+                    }
+                }
+                // 然后计算cancel降分
+                if (!endnode) {
+                    int current_step_u_num = score_ranges[s].len;
+                    int u = score_ranges[s].start_u;
+                    current_continuous_read_num = 0;
+                    for (int i = 0; i < current_step_u_num; i++) {
+                        if (surplus_token - 1 >= 0) {
+                            surplus_token--;
+                            actual_score -= disks[d].units[u].number_unfi_req * cancellation_penalty_factor; // 是否需要进一步深思熟虑？？？？？？？？？？？？？？？？
+                            current_step_read_u++;
+                        }
+                        else {
+                            endnode = true;
+                            break;
+                        }
+                    }
+                }
+                current_score = actual_score + avg_req_u * can_read_unit_per_token * surplus_token * token_score_transfer_rate;
+            }
+            if (s + 1 == score_ranges.size()) {
+                endnode = true;
+            }
+        }
+        else {
+            current_continuous_read_num = last_node.current_continuous_read_num;
+            current_step = last_node.current_step;
+            last_action = last_node.last_action;
+            history_actions = last_node.history_actions;
+            surplus_token = last_node.surplus_token;
+            actual_score = last_node.actual_score;
+        }
+    }
+};
+
+// 比较器：分数高的优先
+struct CompareNode {
+    bool operator()(const Node& a, const Node& b) const {
+        return a.current_score < b.current_score;
+    }
+};
+
 
 #pragma endregion
 
@@ -288,17 +642,445 @@ vector<vector<bool>> tag_on_heat;
 ///////////////////////////////////////////////////////////////////    函数部分    /////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////    函数部分    /////////////////////////////////////////////////////////////////////////////////////////
 
-//////////////////  对象读取操作 （子函数）  执行磁盘指针动作的输出                        尚未更新为复赛版本！！！！！！！！！！！！！
-void print_pointer_action_and_finished_requsets() {
+//////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////// RECYCLE ////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////
+
+//////////////////  垃圾回收操作 （母函数）  执行unit交换
+void garbage_collection_action() {
+    string line;
+    if (debug_mode) {
+        getline(file, line);
+        if (line[0] != 'G') {
+            throw runtime_error("行错误，请检查");
+        }
+        printf("%s\n", line.c_str());
+    }
+    else {
+        scanf("%s", &line);
+        printf("GARBAGE COLLECTION\n");
+    }
+    fflush(stdout);
 
     output_cache.clear();
+    //output_cache += "GARBAGE COLLECTION\n";
+
+    printf(output_cache.c_str());
+    
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////// READ //////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////  对象读取操作（子函数的子函数） 执行磁盘头规划（连续读取）                        尚未更新为复赛版本！！！！！！！！！！！！！
+//void execute_continuous_read(int d, int token_left, int pt, int num_actions) {
+//    int continuous_read = 0;
+//    // 剩余token可以read
+//    while (token_left - require_token[continuous_read] >= 0) {
+//        //read 一次
+//        token_left -= require_token[continuous_read];  //扣除token_left
+//        num_actions++;  // 增加action数
+//        continuous_read++; // 增加连续读取数
+//        if (disks[d].units[pt].occupied) {
+//            //disks[d].read_plan[disks[d].read_plan_pointer] = num_actions; // 更新action flow的read标记
+//            //disks[d].read_obj[disks[d].read_plan_pointer] = disks[d].units[pt].obj_id;
+//            //disks[d].read_phase[disks[d].read_plan_pointer] = disks[d].units[pt].obj_phase;
+//            //disks[d].read_plan_pointer++; // 推进read标记指针
+//
+//            int fi_req = disks[d].units[pt].number_unfi_req;
+//            int p = disks[d].units[pt].partition_id;
+//            if (fi_req > 0) {
+//                disks[d].partitions[p].req_u_number--;
+//            }
+//            disks[d].partitions[disks[d].units[pt].partition_id].num_req -= fi_req;//清空unit其中未读取的任务
+//            disks[d].units[pt].number_unfi_req = 0; //清空unit其中未读取的任务
+//            for (int k = 0; k < REP_NUM - 1; k++) {
+//                int d2 = disks[d].units[pt].rep_disk_id[k];
+//                int u = disks[d].units[pt].rep_unit_id[k];
+//                disks[d2].partitions[disks[d2].units[u].partition_id].num_req -= fi_req;
+//                disks[d2].units[u].number_unfi_req = 0;
+//            }
+//        }
+//        else {
+//            //disks[d].read_plan[disks[d].read_plan_pointer] = num_actions;
+//            //disks[d].read_obj[disks[d].read_plan_pointer] = 0;
+//            //disks[d].read_phase[disks[d].read_plan_pointer] = -1;
+//            //disks[d].read_plan_pointer++; // 推进read标记指针
+//        }
+//        pt = disks[d].units[pt].nxt_unit_id;
+//    }
+//    // 剩余token 已不足一次read，向后搜索request unit
+//    while (token_left > 0) {
+//        if (disks[d].units[pt].number_unfi_req > 0) {
+//            break;
+//        }
+//        //pass 一次
+//        token_left--;
+//        num_actions++;
+//        pt = disks[d].units[pt].nxt_unit_id;
+//    }
+//    // 赋予该ts的指令
+//    //disks[d].plan_over_mark = num_actions;
+//    //disks[d].action_flow = dft_action_flow[num_actions];
+//    //for (int t = 0; t < disks[d].read_plan_pointer; t++) {
+//    //    disks[d].action_flow[disks[d].read_plan[t] - 1] = 'r';
+//    //}
+//
+//    ////////////////////////////
+//    //disks[d].pointer_location = pt;
+//    // 更新request状态
+//    if (disks[d].read_plan_pointer[0] > 0) {
+//        update_request_status(d);
+//    }
+//    //////////////////////////
+//}
+//
+//
+////////////////////  对象读取操作（子函数的子函数） 赋予 disk head 具体jump到哪个unit
+//void give_diskhead_jump_unit(int d, int disk_head_number, int p, vector<vector<bool>>* disk_need_jump, vector<vector<int>>* head_start_unit) {
+//    int first_u = disks[d].partitions[p].first_unit;
+//    int last_u = disks[d].partitions[p].last_unit;
+//    int start_u;
+//    for (start_u = first_u; start_u <= last_u; start_u++) {
+//        if (disks[d].units[start_u].number_unfi_req > 0) {
+//            break;
+//        }
+//    }
+//    if (disks[d].units[start_u].number_unfi_req > 0) {
+//        (*disk_need_jump)[d][disk_head_number] = true;
+//        (*head_start_unit)[d][disk_head_number] = start_u;
+//    }
+//}
+//
+////////////////////  对象读取操作（子函数的子函数） 寻找到disk head 最值得jump的part
+//int choose_diskhead_jump_part(int d, vector<size_t> req_rho_sort_sequence) {
+//
+//
+//}
+//
+////////////////////  对象读取操作（子函数的子函数） 选择磁盘头jump或read                        尚未更新为复赛版本！！！！！！！！！！！！！
+//void give_best_diskhead_plan(vector<vector<bool>>* disk_need_jump, vector<vector<int>>* head_start_unit, vector<vector<bool>>* diskhead_have_planned, bool* did_new_plan) {
+//    // 按随机顺序为disk读取指针规划行为
+//    random_shuffle(disk_sequence.begin(), disk_sequence.end());
+//
+//    (*disk_need_jump).resize(Num_Disks);
+//    (*head_start_unit).resize(Num_Disks);
+//
+//    /*
+//    首先评估所有partition的读取优先级
+//
+//    1. 是否为紧急状态的part，需要尽快读取
+//    2. request密度   具体是  请求数量 ÷ Part_Size
+//    3. 读取整个part  所需的时间ts
+//
+//    */
+//
+//    for (int i = 0; i < Num_Disks; i++) {
+//        int d = disk_sequence[i];
+//        //
+//        vector<int> urgent_partition_list;
+//        vector<double> partition_req_rho_list;
+//        int num_parts = disks[d].partitions.size();
+//        partition_req_rho_list.resize(num_parts);
+//        for (int p = 0; p < num_parts; p++) {
+//            if (disks[d].partitions[p].is_urgent) {
+//                urgent_partition_list.push_back(p);
+//            }
+//            partition_req_rho_list[p] = disks[d].partitions[p].req_rho;
+//        }
+//        //  降序排列req_rho
+//        vector<size_t> req_rho_sort_sequence = sort_indexes(partition_req_rho_list, false);
+//
+//        //  优先处理urgent part
+//        for (int q = 0; q < urgent_partition_list.size(); q++) {
+//            int p = urgent_partition_list[q];
+//            if (disks[d].partitions[p].on_reading) {
+//                continue;
+//            }
+//            bool is_processed = false;
+//            for (int h = 0; h < DISK_HEAD_NUM; h++) {
+//                if (disks[d].diskheads[h].urgency_level == 0) {
+//                    //即可执行jump，jump到urgent part 执行任务;
+//                    give_diskhead_jump_unit(d, h, p, disk_need_jump, head_start_unit);
+//                    disks[d].partitions[p].on_reading = true;
+//                    disks[d].diskheads[h].urgency_level = 2;
+//                    disks[d].diskheads[h].current_task_part = p;
+//                    is_processed = true;
+//                    break;
+//                }
+//            }
+//            if (!is_processed) {
+//                // 调度任务较轻的req
+//                vector<double> current_part_rho;
+//                current_part_rho.resize(DISK_HEAD_NUM);
+//                for (int h = 0; h < DISK_HEAD_NUM; h++) {
+//                    if (disks[d].diskheads[h].urgency_level == 2) {
+//                        current_part_rho[h] = 9999999;
+//                    }
+//                    else {
+//                        current_part_rho[h] = disks[d].partitions[disks[d].diskheads[h].current_task_part].req_rho;
+//                    }
+//                }
+//                size_t h = index_of_min(current_part_rho);
+//                if (disks[d].diskheads[h].urgency_level != 2) {
+//                    //即可执行jump，jump到urgent part 执行任务;
+//                    give_diskhead_jump_unit(d, h, p, disk_need_jump, head_start_unit);
+//                    disks[d].partitions[p].on_reading = true;
+//                    disks[d].diskheads[h].urgency_level = 2;
+//                    disks[d].diskheads[h].current_task_part = p;
+//                    is_processed = true;
+//                }
+//            }
+//        }
+//
+//        // 为不执行urgent_task的disk head 规划行为
+//        for (int h = 0; h < DISK_HEAD_NUM; h++) {
+//            if ((*diskhead_have_planned)[d][h]) {
+//                continue;
+//            }
+//            int urgency_level = disks[d].diskheads[h].urgency_level;
+//            if (urgency_level == 2) {
+//                continue;
+//            }
+//            if (urgency_level == 0) {
+//                // 同时考虑jump和read;
+//                int jump_p = 0;
+//                double jump_p_req_rho = -1;
+//                int jump_p_ts_requirement = -1;
+//                // 首先给出最值得jump的part
+//                for (int j = 0; j < num_parts; j++) {
+//                    jump_p = req_rho_sort_sequence[j];
+//                    if (disks[d].partitions[jump_p].on_reading) {
+//                        continue;
+//                    }
+//                    jump_p_req_rho = disks[d].partitions[jump_p].req_rho;
+//                    jump_p_ts_requirement = disks[d].partitions[jump_p].finish_reading_surplus_ts;
+//                }
+//
+//                if (jump_p_ts_requirement == -1) {
+//                    throw runtime_error("挑选jump_part异常");
+//                }
+//                if (disks[d].partitions[jump_p].num_req == 0) {
+//                    此时在初始阶段，可以考虑jump到任意有object的位置;
+//                }
+//                // 后给出在当前part执行read的性价比
+//                int current_p = disks[d].diskheads[h].current_task_part;
+//                if (current_p == jump_p) {
+//                    不执行jump，直接执行read;
+//                    //give_diskhead_jump_unit(d, h, p, disk_need_jump, head_start_unit);
+//                    disks[d].partitions[current_p].on_reading = true;
+//                    disks[d].diskheads[h].urgency_level = 1;
+//                    把这个扔进函数里处理好：diskhead_have_planned;
+//                    //disks[d].diskheads[h].current_task_part = current_p;
+//                    //is_processed = true;
+//                }
+//                else {
+//                    double current_p_req_rho = disks[d].partitions[current_p].req_rho;
+//                    int current_p_ts_requirement = disks[d].partitions[current_p].finish_reading_surplus_ts;
+//                    if (比较两者的性价比，选择一个方案) {
+//                        //如果jump性价比更高，执行jump;
+//                        give_diskhead_jump_unit(d, h, jump_p, disk_need_jump, head_start_unit);
+//                    }
+//                    else {
+//                        如果read性价比更高，执行read;
+//                        //give_diskhead_jump_unit(d, h, p, disk_need_jump, head_start_unit);
+//                        disks[d].partitions[current_p].on_reading = true;
+//                        disks[d].diskheads[h].urgency_level = 1;
+//                        把这个扔进函数里处理好：diskhead_have_planned;
+//                    }
+//                }
+//            }
+//            else {
+//                //urgent level = 1 的情况
+//                只考虑read，考虑执行接下来的read;
+//                把这个扔进函数里处理好：diskhead_have_planned;
+//            }
+//        }
+//
+//        //double current_ts_req_num_rho = 0;
+//        //double current_20ts_req_num_rho = 0;
+//
+//
+//        //int pt = disks[d].pointer_location[0];
+//        //int pt1 = disks[d].pointer_location[0];
+//        //int statistic = 0;
+//        //while (true) {
+//        //    statistic++;
+//        //    if (statistic == 20 * max_continuous_read) {
+//        //        break;
+//        //    }
+//        //    if (statistic <= max_continuous_read) {
+//        //        current_ts_req_num_rho += disks[d].units[pt1].number_unfi_req;
+//        //    }
+//        //    current_20ts_req_num_rho += disks[d].units[pt1].number_unfi_req;
+//        //    pt1++;
+//        //    if (pt1 > SZ_Disks) {
+//        //        pt1 = 1;
+//        //    }
+//        //}
+//
+//        //current_ts_req_num_rho = current_ts_req_num_rho / max_continuous_read;
+//        //current_20ts_req_num_rho = current_20ts_req_num_rho / 20 / max_continuous_read;
+//
+//        //// 计算partition中req_rho最高的
+//        //int max_partition_req_number = 0;
+//        //double max_partition_req_rho = 0;
+//        //for (int p = 1; p < disks[d].partitions.size(); p++) {
+//        //    if (disks[d].partitions[p].sz > 0) {
+//        //        double p_req_rho = double(disks[d].partitions[p].num_req) / disks[d].partitions[p].sz;
+//        //        if (p_req_rho > max_partition_req_rho) {
+//        //            max_partition_req_rho = p_req_rho;
+//        //            max_partition_req_number = p;
+//        //        }
+//        //    }
+//        //}
+//        //if (max_partition_req_rho < 0.0000001) {
+//        //    (*diskhead_have_planned)[d] = true;
+//        //    disks[d].action_flow[0] = "#\n";
+//        //    continue;
+//        //}
+//
+//
+//        //int current_partition_number = disks[d].units[pt].partition_id;
+//        ////partition号相等
+//        //bool did_action_plan = false;
+//        //if (current_partition_number == max_partition_req_number) {
+//        //    // 直接执行规划
+//        //    for (int t = 0; t < Num_Tokens; t++) {
+//        //        int u = pt + t;
+//        //        if (u > SZ_Disks) {
+//        //            u -= SZ_Disks;
+//        //        }
+//        //        if (disks[d].units[u].number_unfi_req > 0) {
+//        //            (*disk_need_jump)[d] = false;
+//        //            give_diskhead_actionflow(d, u);
+//        //            (*diskhead_have_planned)[d] = true;
+//        //            did_action_plan = true;
+//        //            *did_new_plan = true;
+//        //            break;
+//        //        }
+//        //    }
+//        //}
+//
+//        //if (did_action_plan) {
+//        //    continue;
+//        //}
+//
+//        ////partition号不等，决策是否jump
+//        //if (max_partition_req_rho * jump_req_num_rate > current_20ts_req_num_rho) {
+//        //    // 考虑jump partition
+//        //    int jump_u = 0;
+//        //    for (int u = disks[d].partitions[max_partition_req_number].first_unit; u <= disks[d].partitions[max_partition_req_number].last_unit; u++) {
+//        //        if (disks[d].units[u].number_unfi_req > 0) {
+//        //            jump_u = u;
+//        //            break;
+//        //        }
+//        //    }
+//        //    (*disk_need_jump)[d] = true;
+//        //    (*head_start_unit)[d] = jump_u;
+//        //}
+//        //else {
+//        //    int start_u = 0;
+//        //    // 执行规划
+//        //    did_action_plan = false;
+//        //    for (int t = 0; t < Num_Tokens; t++) {
+//        //        int u = pt + t;
+//        //        if (u > SZ_Disks) {
+//        //            u -= SZ_Disks;
+//        //        }
+//        //        if (disks[d].units[u].number_unfi_req > 0) {
+//        //            (*disk_need_jump)[d] = false;
+//        //            give_diskhead_actionflow(d, u);
+//        //            (*diskhead_have_planned)[d] = true;
+//        //            did_action_plan = true;
+//        //            *did_new_plan = true;
+//        //            break;
+//        //        }
+//        //    }
+//        //    if (!did_action_plan) {
+//        //        // 考虑jump partition
+//        //        int jump_u = 0;
+//        //        for (int u = disks[d].partitions[max_partition_req_number].first_unit; u <= disks[d].partitions[max_partition_req_number].last_unit; u++) {
+//        //            if (disks[d].units[u].number_unfi_req > 0) {
+//        //                jump_u = u;
+//        //                break;
+//        //            }
+//        //        }
+//        //        (*disk_need_jump)[d] = true;
+//        //        (*head_start_unit)[d] = jump_u;
+//        //    }
+//        //}
+//    }
+//}
+//
+//
+//
+//
+//
+//////////////////////  对象读取操作（子函数的子函数） 清空分区任务，上报繁忙
+//void cancel_req_in_partition(int d, int p) {
+//    int first_u = disks[d].partitions[p].first_unit;
+//    int last_u = disks[d].partitions[p].last_unit;
+//    int obj_id = 0;
+//    for (int u = first_u; u <= last_u; u++) {
+//        if (!disks[d].units[u].occupied) {
+//            continue;
+//        }
+//        obj_id = disks[d].units[u].obj_id;
+//        int last_req_point = object[obj_id].last_request_point;
+//        if (request[last_req_point].is_done) {
+//            continue;
+//        }
+//        // 存在未完成的任务
+//        int obj_sz = object[obj_id].size;
+//        int tag = object[obj_id].tag;
+//        for (int r = 0; r < REP_NUM; r++) {
+//            int d1 = object[obj_id].replica_disk[r];
+//            int p1 = object[obj_id].replica_partition[r];
+//            for (int v = 0; v < obj_sz; v++) {
+//                int u1 = object[obj_id].store_units[r][v];
+//                int num_unfi_req = disks[d1].units[u1].number_unfi_req;
+//                disks[d1].partitions[p1].num_req -= num_unfi_req;
+//                disks[d1].partitions[p1].num_current_tag_req[tag] -= num_unfi_req;
+//                disks[d1].partitions[p1].num_u_with_req--;
+//                disks[d1].partitions[p1].req_u_number--;
+//                disks[d1].units[u1].is_urgent = false;
+//                disks[d1].units[u1].number_unfi_req = 0;
+//            }
+//        }
+//        // 将所有is_done 为false 的请求上报
+//        while (true) {
+//            if (request[last_req_point].is_done) {
+//                break;
+//            }
+//            request[last_req_point].is_done = true;
+//            busy_requests[n_busy] = last_req_point;
+//            n_busy++;
+//            for (int i = 0; i < obj_sz; i++) {
+//                request[last_req_point].have_read[i] = true;
+//            }
+//            last_req_point = request[last_req_point].prev_id;
+//        }
+//    }
+//}
+
+
+//////////////////  对象读取操作 （子函数）  执行磁盘指针动作的输出 
+void print_pointer_action_and_finished_requsets() {
+
+    // 上报完成的请求
+    output_cache.clear();
     for (int d = 0; d < Num_Disks; d++) {
-        if (disks[d].execute_jump) {
-            output_cache += "j " + to_string(disks[d].jump_unit) + "\n";
-            disks[d].execute_jump = false;
-        }
-        else {
-            output_cache += disks[d].action_flow;
+        for (int h = 0; h < DISK_HEAD_NUM; h++) {
+            if (disks[d].diskheads[h].execute_jump) {
+                output_cache += "j " + to_string(disks[d].diskheads[h].jump_unit) + "\n";
+                disks[d].diskheads[h].execute_jump = false;
+            }
+            else {
+                output_cache += disks[d].diskheads[h].action_flow;
+            }
         }
     }
 
@@ -314,34 +1096,30 @@ void print_pointer_action_and_finished_requsets() {
 
     finished_request_pt = 0;
     fflush(stdout);
-}
 
-
-void execute_diskhead_jump(vector<bool> disk_need_jump, vector<int> head_start_unit, vector<bool> diskhead_have_planned) {
-    // 执行jump
-    for (int d = 0; d < Num_Disks; d++) {
-        if (diskhead_have_planned[d]) {
-            continue;
-        }
-        if (disk_need_jump[d]) {
-            disks[d].execute_jump = true;
-            disks[d].jump_unit = head_start_unit[d];
-            disks[d].pointer_location = disks[d].jump_unit;
-        }
+    // 上报繁忙的请求
+    output_cache.clear();
+    output_cache += to_string(n_busy) + "\n";
+    for (int i = 0; i < n_busy; i++) {
+        output_cache += to_string(busy_requests[i]);  // 拼接字符串或数字
+        output_cache += "\n";
     }
+    printf(output_cache.c_str());
+    n_busy = 0;
+    fflush(stdout);
 }
 
-//////////////////  对象读取操作（子函数的子函数） object、request状态更新                        尚未更新为复赛版本！！！！！！！！！！！！！
-void update_request_status(int d) {
+//////////////////  对象读取操作（子函数的子函数） object、request状态更新 
+void update_request_status(int d, int h) {
     // 更新被读取的object状态和request状态
-    int obj_id = disks[d].read_obj[0];
+    int obj_id = disks[d].diskheads[h].read_obj[0];
     vector<int> read_phase;
     read_phase.resize(MAX_OBJECT_SIZE);
     int iter = 0;
-    read_phase[iter] = disks[d].read_phase[0];
+    read_phase[iter] = disks[d].diskheads[h].read_phase[0];
     iter++;
-    for (int i = 1; i <= disks[d].read_plan_pointer; i++) {
-        if (i == disks[d].read_plan_pointer || (disks[d].read_obj[i] != obj_id && disks[d].read_obj[i] != 0 && obj_id != 0)) {
+    for (int i = 1; i <= disks[d].diskheads[h].read_plan_pointer; i++) {
+        if (i == disks[d].diskheads[h].read_plan_pointer || (disks[d].diskheads[h].read_obj[i] != obj_id && disks[d].diskheads[h].read_obj[i] != 0 && obj_id != 0)) {
             // 执行一次request更新
             vector<bool>phase_read_or_not;
             phase_read_or_not.resize(MAX_OBJECT_SIZE);
@@ -352,32 +1130,13 @@ void update_request_status(int d) {
                 phase_read_or_not[read_phase[j]] = true;
             }
             int obj_sz = object[obj_id].size;
-            int szidx = obj_sz - 1;
             int last_req = object[obj_id].last_request_point;
             // 逐一校验任务
-            vector<double> phase_finish_value;
-            phase_finish_value.resize(obj_sz);
-            vector<int> phase_finish_num;
-            phase_finish_num.resize(obj_sz);
-            for (int j = 0; j < obj_sz; j++) {
-                phase_finish_value[j] = 0;
-                phase_finish_num[j] = 0;
-            }
+            
             while (true) {
                 if (request[last_req].is_done) {
                     break;
                 }
-                if (!request[last_req].lose_value) {
-                    int surplus_period = EXTRA_TIME - (ts - request[last_req].arrival_ts);
-                    for (int j = 0; j < obj_sz; j++) {
-                        // 完成该unit的request，扣除value
-                        if (phase_read_or_not[j] && !request[last_req].have_read[j]) {
-                            phase_finish_value[j] += surplus_period * request_sz_unit_value_ts_loss[szidx];
-                            phase_finish_num[j]++;
-                        }
-                    }
-                }
-
                 bool all_read = true;
                 for (int j = 0; j < obj_sz; j++) {
                     if (phase_read_or_not[j] || request[last_req].have_read[j]) {
@@ -400,45 +1159,50 @@ void update_request_status(int d) {
             //
             iter = 0;
 
-            if (i != disks[d].read_plan_pointer) {
-                obj_id = disks[d].read_obj[i];
-                read_phase[iter] = disks[d].read_phase[i];
+            if (i != disks[d].diskheads[h].read_plan_pointer) {
+                obj_id = disks[d].diskheads[h].read_obj[i];
+                read_phase[iter] = disks[d].diskheads[h].read_phase[i];
                 iter++;
             }
         }
         else {
-            if (obj_id != 0 && disks[d].read_obj[i] != 0) {
-                read_phase[iter] = disks[d].read_phase[i];
+            if (obj_id != 0 && disks[d].diskheads[h].read_obj[i] != 0) {
+                read_phase[iter] = disks[d].diskheads[h].read_phase[i];
                 iter++;
             }
-            if (obj_id == 0 && disks[d].read_obj[i] != 0) {
+            if (obj_id == 0 && disks[d].diskheads[h].read_obj[i] != 0) {
                 iter = 0;
-                obj_id = disks[d].read_obj[i];
-                read_phase[iter] = disks[d].read_phase[i];
+                obj_id = disks[d].diskheads[h].read_obj[i];
+                read_phase[iter] = disks[d].diskheads[h].read_phase[i];
                 iter++;
             }
         }
     }
 
-    disks[d].read_plan_pointer = 0;
+    disks[d].diskheads[h].read_plan_pointer = 0;
 }
 
-//////////////////  对象读取操作（子函数的子函数） 执行磁盘头规划（非连续读取）                        尚未更新为复赛版本！！！！！！！！！！！！！
-void execute_pass_read(int d, int token_left, int pt, int num_actions) {
-    // pass read
+////////////////////  对象读取操作（子函数的子函数） 执行磁盘头规划（非连续读取）
+void excute_pass_read(int d, int h, int token_left, int num_actions) {
+    // 不考虑连续读取，直接往前读取带有request的unit
     int continuous_read = 0;
+    int pt = disks[d].diskheads[h].pointer_location;
     while (token_left - require_token[continuous_read] >= 0) {
         if (disks[d].units[pt].number_unfi_req > 0 && disks[d].units[pt].occupied) {
             // read 一次
             token_left -= require_token[continuous_read];  //扣除token_left
             num_actions++;  // 增加action数
             continuous_read++; // 增加连续读取数
-            disks[d].read_plan[disks[d].read_plan_pointer] = num_actions; // 更新action flow的read标记
-            disks[d].read_obj[disks[d].read_plan_pointer] = disks[d].units[pt].obj_id;
-            disks[d].read_phase[disks[d].read_plan_pointer] = disks[d].units[pt].obj_phase;
-            disks[d].read_plan_pointer++;
+            disks[d].diskheads[h].read_plan[disks[d].diskheads[h].read_plan_pointer] = num_actions; // 更新action flow的read标记
+            disks[d].diskheads[h].read_obj[disks[d].diskheads[h].read_plan_pointer] = disks[d].units[pt].obj_id;
+            disks[d].diskheads[h].read_phase[disks[d].diskheads[h].read_plan_pointer] = disks[d].units[pt].obj_phase;
+            disks[d].diskheads[h].read_plan_pointer++;
 
             int fi_req = disks[d].units[pt].number_unfi_req;
+            int p = disks[d].units[pt].partition_id;
+            if (fi_req > 0) {
+                disks[d].partitions[p].req_u_number--;
+            }
             disks[d].partitions[disks[d].units[pt].partition_id].num_req -= fi_req;//清空unit其中未读取的任务
             disks[d].units[pt].number_unfi_req = 0; //清空unit其中未读取的任务
             for (int k = 0; k < REP_NUM - 1; k++) {//清空 replica 的 unit其中未读取的任务
@@ -468,82 +1232,24 @@ void execute_pass_read(int d, int token_left, int pt, int num_actions) {
         pt = disks[d].units[pt].nxt_unit_id;
     }
 
-    // 赋予该ts的指令
-    disks[d].plan_over_mark = num_actions;
-    disks[d].action_flow = dft_action_flow[num_actions];
-    for (int t = 0; t < disks[d].read_plan_pointer; t++) {
-        disks[d].action_flow[disks[d].read_plan[t] - 1] = 'r';
+    //// 赋予该ts的指令
+    disks[d].diskheads[h].plan_over_mark = num_actions;
+    disks[d].diskheads[h].action_flow = dft_action_flow[num_actions];
+    for (int t = 0; t < disks[d].diskheads[h].read_plan_pointer; t++) {
+        disks[d].diskheads[h].action_flow[disks[d].diskheads[h].read_plan[t] - 1] = 'r';
     }
 
-    //////////////////////////
-    disks[d].pointer_location = pt;
+    ////////////////////////////
+    disks[d].diskheads[h].pointer_location = pt;
     // 更新request状态
-    if (disks[d].read_plan_pointer > 0) {
-        update_request_status(d);
+    if (disks[d].diskheads[h].read_plan_pointer > 0) {
+        update_request_status(d, h);
     }
     //////////////////////////
+
 }
 
-//////////////////  对象读取操作（子函数的子函数） 执行磁盘头规划（连续读取）                        尚未更新为复赛版本！！！！！！！！！！！！！
-void execute_continuous_read(int d, int token_left, int pt, int num_actions) {
-    int continuous_read = 0;
-    // 剩余token可以read
-    while (token_left - require_token[continuous_read] >= 0) {
-        //read 一次
-        token_left -= require_token[continuous_read];  //扣除token_left
-        num_actions++;  // 增加action数
-        continuous_read++; // 增加连续读取数
-        if (disks[d].units[pt].occupied) {
-            disks[d].read_plan[disks[d].read_plan_pointer] = num_actions; // 更新action flow的read标记
-            disks[d].read_obj[disks[d].read_plan_pointer] = disks[d].units[pt].obj_id;
-            disks[d].read_phase[disks[d].read_plan_pointer] = disks[d].units[pt].obj_phase;
-            disks[d].read_plan_pointer++; // 推进read标记指针
-
-            int fi_req = disks[d].units[pt].number_unfi_req;
-            disks[d].partitions[disks[d].units[pt].partition_id].num_req -= fi_req;//清空unit其中未读取的任务
-            disks[d].units[pt].number_unfi_req = 0; //清空unit其中未读取的任务
-            for (int k = 0; k < REP_NUM - 1; k++) {
-                int d2 = disks[d].units[pt].rep_disk_id[k];
-                int u = disks[d].units[pt].rep_unit_id[k];
-                disks[d2].partitions[disks[d2].units[u].partition_id].num_req -= fi_req;
-                disks[d2].units[u].number_unfi_req = 0;
-            }
-        }
-        else {
-            disks[d].read_plan[disks[d].read_plan_pointer] = num_actions;
-            disks[d].read_obj[disks[d].read_plan_pointer] = 0;
-            disks[d].read_phase[disks[d].read_plan_pointer] = -1;
-            disks[d].read_plan_pointer++; // 推进read标记指针
-        }
-        pt = disks[d].units[pt].nxt_unit_id;
-    }
-    // 剩余token 已不足一次read，向后搜索request unit
-    while (token_left > 0) {
-        if (disks[d].units[pt].number_unfi_req > 0) {
-            break;
-        }
-        //pass 一次
-        token_left--;
-        num_actions++;
-        pt = disks[d].units[pt].nxt_unit_id;
-    }
-    // 赋予该ts的指令
-    disks[d].plan_over_mark = num_actions;
-    disks[d].action_flow = dft_action_flow[num_actions];
-    for (int t = 0; t < disks[d].read_plan_pointer; t++) {
-        disks[d].action_flow[disks[d].read_plan[t] - 1] = 'r';
-    }
-
-    //////////////////////////
-    disks[d].pointer_location = pt;
-    // 更新request状态
-    if (disks[d].read_plan_pointer > 0) {
-        update_request_status(d);
-    }
-    //////////////////////////
-}
-
-//////////////////  对象读取操作（子函数的子函数） 计算可以连续读取的block数量                        尚未更新为复赛版本！！！！！！！！！！！！！
+//////////////////  对象读取操作（子函数的子函数） 计算可以连续读取的block数量
 int calc_max_continuous_read(int token_left) {
     int max_continuous_read = 0;
     for (auto x = require_token_accumulated.begin(); x != require_token_accumulated.end(); x++) {
@@ -557,215 +1263,766 @@ int calc_max_continuous_read(int token_left) {
     return max_continuous_read;
 }
 
+
+
+
 //////////////////  对象读取操作（子函数的子函数） 执行磁盘头read方案的规划                        尚未更新为复赛版本！！！！！！！！！！！！！
-void give_diskhead_actionflow(int d, int start_pt) {
-    int last_pt;
-    int pt = disks[d].pointer_location;
+void a_star_search_diskhead_actionflow(int d, int h, int start_pt, int surplus_token, int num_actions) {
+
+    // 算法主体
+    // STEP 1 : 向前扫描整个 scan_mutiple_factor * max_continuous_read 范围
+    vector<Score_Range> score_ranges;
+    double avg_req_u = 0.0;
+    for (int u = start_pt; u < start_pt + scan_mutiple_factor * max_continuous_read; u++) {
+        avg_req_u += disks[d].units[u].number_unfi_req;
+    }
+    avg_req_u /= scan_mutiple_factor * max_continuous_read;
+    Score_Range sc;
+    int dist = 0;
+    for (int u = start_pt; u < start_pt + scan_mutiple_factor * max_continuous_read; u++) {
+        if (!disks[d].units[u].occupied || disks[d].units[u].number_unfi_req == 0) {
+            dist++;
+            if (sc.len > 0) {
+                sc.score_per_u /= sc.len;
+                score_ranges.push_back(sc);
+                sc.len = 0;
+            }
+        }
+        else {
+            if (sc.len == 0) {
+                sc.start_u = u;
+                sc.len = 1;
+                sc.score_per_u = disks[d].units[u].number_unfi_req;
+                if (disks[d].units[u].number_unfi_req < avg_req_u) {
+                    sc.lower_than_avg = true;
+                }
+                else {
+                    sc.lower_than_avg = false;
+                }
+                sc.distance_from_last_range = dist;
+                dist = 0;
+            }
+            else {
+                if (disks[d].units[u].number_unfi_req >= avg_req_u && sc.lower_than_avg) {
+                    sc.score_per_u /= sc.len;
+                    score_ranges.push_back(sc);
+                    sc.start_u = u;
+                    sc.len = 1;
+                    sc.score_per_u = disks[d].units[u].number_unfi_req;
+                    sc.lower_than_avg = false;
+                    sc.distance_from_last_range = dist;
+                }
+                else if (disks[d].units[u].number_unfi_req < avg_req_u && !sc.lower_than_avg) {
+                    sc.score_per_u /= sc.len;
+                    score_ranges.push_back(sc);
+                    sc.start_u = u;
+                    sc.len = 1;
+                    sc.score_per_u = disks[d].units[u].number_unfi_req;
+                    sc.lower_than_avg = true;
+                    sc.distance_from_last_range = dist;
+                }
+                else {
+                    sc.len++;
+                    sc.score_per_u += disks[d].units[u].number_unfi_req;
+                }
+            }
+        }
+    }
+    if (sc.len > 0) {
+        sc.score_per_u /= sc.len;
+        score_ranges.push_back(sc);
+        sc.len = 0;
+    }
+
+    if (ts == 3016 && d==1&& h==0) {
+        int a = 1;
+    }
+
+    // STEP 2 : A* search法寻找最佳方案
+    // 创建优先队列
+    priority_queue<Node, vector<Node>, CompareNode> node_queue;
+
+    // 给出第一个节点
+    Node init_node = Node(surplus_token);
+    node_queue.push(init_node);
+
+    // 保存最佳节点
+    Node best_node = init_node;
+
     while (true) {
-        if (start_pt == pt) {
+
+        // 取出优先队列顶部的节点
+        Node node = node_queue.top();
+        node_queue.pop();
+        // 若为endnode，不执行新增节点。
+        if (node.endnode) {
+            // 记录该结果
+            if (node.actual_score > best_node.actual_score) {
+                best_node = node;
+            }
+        }
+        else {
+            int s = node.current_step;
+            // 首先考虑下一步为 continuous_read
+            Node c_r_node = Node(node, 2, score_ranges, d, avg_req_u);
+            node_queue.push(c_r_node);
+            //  接下来考虑下一步为 pass_read。若distance=0，不考虑pass_read;
+            if (score_ranges[s].distance_from_last_range != 0) {
+                Node p_r_node = Node(node, 1, score_ranges, d, avg_req_u);
+                node_queue.push(p_r_node);
+            }
+            // 最后考虑下一步为 cancel。若score_range中unit不低于平均req密度，不考虑cancel。
+            //if (score_ranges[s].lower_than_avg) {
+            //    Node cancel_node = Node(node, 0, score_ranges, d, avg_req_u);
+            //    node_queue.push(cancel_node);
+            //}
+        }
+
+        //给出循环终止的判断条件;
+        if (node_queue.empty()) {
             break;
         }
-        if (start_pt == 1) {
-            last_pt = SZ_Disks;
+        if (node_queue.top().current_score * cut_twig_factor < best_node.actual_score) {
+            break;
         }
-        else {
-            last_pt = start_pt - 1;
-        }
-        if (disks[d].units[start_pt].obj_phase != 0 && disks[d].units[last_pt].number_unfi_req != 0) {
-            start_pt--;
-            if (start_pt == 0) {
-                start_pt = SZ_Disks;
-            }
-        }
-        else {
+        if (node_queue.top().current_step >= search_depth) {
             break;
         }
     }
-    // 从start_pt开始检查接下来有请求的request数量
-    int num_actions = 0;
-    int token_left = Num_Tokens;
-    while (pt != start_pt) {
-        num_actions++;
-        pt++;
-        if (pt > SZ_Disks) {
-            pt = 1;
-        }
-        token_left--;
-    }
-    disks[d].pointer_location = pt;
 
-    int still_can_continuous_read = calc_max_continuous_read(token_left);
-    int least_num_unfi_req_unit = still_can_continuous_read * num_unfi_req_unit_rate_for_continuous_read + 1;
-    int num_unfi_req_unit = 0;
-    for (int v = 0; v < still_can_continuous_read; v++) {
-        int u = v + pt;
-        if (u >= SZ_Disks) {
-            u -= SZ_Disks;
-        }
-        if (disks[d].units[u].number_unfi_req > 0) {
-            num_unfi_req_unit++;
-        }
-    }
-    if (num_unfi_req_unit >= least_num_unfi_req_unit) {
-        // continuous read
-        execute_continuous_read(d, token_left, pt, num_actions);
-    }
-    else {
-        // pass read
-        execute_pass_read(d, token_left, pt, num_actions);
-    }
-}
+    // STEP 3 : 后处理搜索最佳结果
+    if (best_node.actual_score > 0) {
+        disks[d].diskheads[h].read_plan_pointer = 0;
+        vector<int> actions = best_node.history_actions;
+        actions.erase(actions.begin());
+        actions.push_back(best_node.last_action);
+        int u = start_pt;
+        int continuous_read = 0;
+        for (int i = 0; i < actions.size(); i++) {
+            if (actions[i] == 0) {
+                //这里需要对request进行删除操作
+                continuous_read = 0;
+                //while (u != score_ranges[i].start_u) {
+                //    surplus_token--;
+                //    u = disks[d].units[u].nxt_unit_id;
+                //    num_actions++;
+                //}
+                //// 对这个区间的请求上报取消
+                //for (int j = 0; j < score_ranges[i].len; j++) {
+                //    surplus_token--;
+                //    int obj = disks[d].units[u].obj_id;
+                //    int phase = disks[d].units[u].obj_phase;
+                //    int last_req = object[obj].last_request_point;
 
-//////////////////  对象读取操作（子函数的子函数） 选择磁盘头jump或read                        尚未更新为复赛版本！！！！！！！！！！！！！
-void give_best_diskhead_plan(vector<bool>* disk_need_jump, vector<int>* head_start_unit, vector<bool>* diskhead_have_planned, bool* did_new_plan) {
-    // 按随机顺序为disk读取指针规划行为
-    random_shuffle(disk_sequence.begin(), disk_sequence.end());
+                //    仔细考虑上报取消怎么写。;
+                //    num_actions++;
+                //}
 
-    (*disk_need_jump).resize(Num_Disks);
-    (*head_start_unit).resize(Num_Disks);
-
-    for (int i = 0; i < Num_Disks; i++) {
-        int d = disk_sequence[i];
-        if ((*diskhead_have_planned)[d]) {
-            continue;
-        }
-        double current_ts_req_num_roe = 0;
-        double current_20ts_req_num_roe = 0;
-
-
-        int pt = disks[d].pointer_location;
-        int pt1 = disks[d].pointer_location;
-        int statistic = 0;
-        while (true) {
-            statistic++;
-            if (statistic == 20 * max_continuous_read) {
-                break;
             }
-            if (statistic <= max_continuous_read) {
-                current_ts_req_num_roe += disks[d].units[pt1].number_unfi_req;
-            }
-            current_20ts_req_num_roe += disks[d].units[pt1].number_unfi_req;
-            pt1++;
-            if (pt1 > SZ_Disks) {
-                pt1 = 1;
-            }
-        }
-
-        current_ts_req_num_roe = current_ts_req_num_roe / max_continuous_read;
-        current_20ts_req_num_roe = current_20ts_req_num_roe / 20 / max_continuous_read;
-
-        // 计算partition中req_roe最高的
-        int max_partition_req_number = 0;
-        double max_partition_req_roe = 0;
-        for (int p = 1; p < disks[d].partitions.size(); p++) {
-            if (disks[d].partitions[p].sz > 0) {
-                double p_req_roe = double(disks[d].partitions[p].num_req) / disks[d].partitions[p].sz;
-                if (p_req_roe > max_partition_req_roe) {
-                    max_partition_req_roe = p_req_roe;
-                    max_partition_req_number = p;
+            else if (actions[i] == 1) {
+                // 这里需要对request执行pass read
+                while (u != score_ranges[i].start_u) {
+                    surplus_token--;
+                    u = disks[d].units[u].nxt_unit_id;
+                    num_actions++;
+                    continuous_read = 0;
                 }
-            }
-        }
-        if (max_partition_req_roe < 0.0000001) {
-            (*diskhead_have_planned)[d] = true;
-            disks[d].action_flow = "#\n";
-            continue;
-        }
 
+                for (int j = 0; j < score_ranges[i].len; j++) {
+                    if (surplus_token - require_token[continuous_read] >= 0) {
+                        surplus_token -= require_token[continuous_read];
+                        continuous_read++;
+                        num_actions++;
+                        int read_plan_pt = disks[d].diskheads[h].read_plan_pointer;
+                        int obj = disks[d].units[u].obj_id;
+                        int phase = disks[d].units[u].obj_phase;
+                        disks[d].diskheads[h].read_obj[read_plan_pt] = obj;
+                        disks[d].diskheads[h].read_phase[read_plan_pt] = phase;
+                        disks[d].diskheads[h].read_plan[read_plan_pt] = num_actions;
+                        disks[d].diskheads[h].read_plan_pointer++;
+                        
 
-        int current_partition_number = disks[d].units[pt].partition_id;
-        //partition号相等
-        bool did_action_plan = false;
-        if (current_partition_number == max_partition_req_number) {
-            // 直接执行规划
-            for (int t = 0; t < Num_Tokens; t++) {
-                int u = pt + t;
-                if (u > SZ_Disks) {
-                    u -= SZ_Disks;
-                }
-                if (disks[d].units[u].number_unfi_req > 0) {
-                    (*disk_need_jump)[d] = false;
-                    give_diskhead_actionflow(d, u);
-                    (*diskhead_have_planned)[d] = true;
-                    did_action_plan = true;
-                    *did_new_plan = true;
-                    break;
-                }
-            }
-        }
-
-        if (did_action_plan) {
-            continue;
-        }
-
-        //partition号不等，决策是否jump
-        if (max_partition_req_roe * jump_req_num_rate > current_20ts_req_num_roe) {
-            // 考虑jump partition
-            int jump_u = 0;
-            for (int u = disks[d].partitions[max_partition_req_number].first_unit; u <= disks[d].partitions[max_partition_req_number].last_unit; u++) {
-                if (disks[d].units[u].number_unfi_req > 0) {
-                    jump_u = u;
-                    break;
-                }
-            }
-            (*disk_need_jump)[d] = true;
-            (*head_start_unit)[d] = jump_u;
-        }
-        else {
-            int start_u = 0;
-            // 执行规划
-            did_action_plan = false;
-            for (int t = 0; t < Num_Tokens; t++) {
-                int u = pt + t;
-                if (u > SZ_Disks) {
-                    u -= SZ_Disks;
-                }
-                if (disks[d].units[u].number_unfi_req > 0) {
-                    (*disk_need_jump)[d] = false;
-                    give_diskhead_actionflow(d, u);
-                    (*diskhead_have_planned)[d] = true;
-                    did_action_plan = true;
-                    *did_new_plan = true;
-                    break;
-                }
-            }
-            if (!did_action_plan) {
-                // 考虑jump partition
-                int jump_u = 0;
-                for (int u = disks[d].partitions[max_partition_req_number].first_unit; u <= disks[d].partitions[max_partition_req_number].last_unit; u++) {
-                    if (disks[d].units[u].number_unfi_req > 0) {
-                        jump_u = u;
+                        int fi_req = disks[d].units[u].number_unfi_req;
+                        int p = disks[d].units[u].partition_id;
+                        if (fi_req > 0) {
+                            disks[d].partitions[p].req_u_number--;
+                        }
+                        disks[d].partitions[disks[d].units[u].partition_id].num_req -= fi_req;//清空unit其中未读取的任务
+                        disks[d].units[u].number_unfi_req = 0; //清空unit其中未读取的任务
+                        for (int k = 0; k < REP_NUM - 1; k++) {//清空 replica 的 unit其中未读取的任务
+                            int d2 = disks[d].units[u].rep_disk_id[k];
+                            int u2 = disks[d].units[u].rep_unit_id[k];
+                            disks[d2].partitions[disks[d2].units[u2].partition_id].num_req -= fi_req;
+                            disks[d2].units[u2].number_unfi_req = 0;
+                        }
+                        u = disks[d].units[u].nxt_unit_id;
+                    }
+                    else {
                         break;
                     }
                 }
-                (*disk_need_jump)[d] = true;
-                (*head_start_unit)[d] = jump_u;
+            }
+            else if (actions[i] == 2) {
+                // 这里需要对request执行 continuous read
+                while (u != score_ranges[i].start_u) {
+                    surplus_token -= require_token[continuous_read];
+                    continuous_read++;
+                    num_actions++;
+                    int read_plan_pt = disks[d].diskheads[h].read_plan_pointer;
+                    disks[d].diskheads[h].read_obj[read_plan_pt] = 0;
+                    disks[d].diskheads[h].read_phase[read_plan_pt] = 0;
+                    disks[d].diskheads[h].read_plan[read_plan_pt] = num_actions;
+                    disks[d].diskheads[h].read_plan_pointer++;
+                    u = disks[d].units[u].nxt_unit_id;
+                }
+
+                for (int j = 0; j < score_ranges[i].len; j++) {
+                    if (surplus_token - require_token[continuous_read] >= 0) {
+                        surplus_token -= require_token[continuous_read];
+                        num_actions++;
+                        continuous_read++;
+                        int read_plan_pt = disks[d].diskheads[h].read_plan_pointer;
+                        int obj = disks[d].units[u].obj_id;
+                        int phase = disks[d].units[u].obj_phase;
+                        disks[d].diskheads[h].read_obj[read_plan_pt] = obj;
+                        disks[d].diskheads[h].read_phase[read_plan_pt] = phase;
+                        disks[d].diskheads[h].read_plan[read_plan_pt] = num_actions;
+                        disks[d].diskheads[h].read_plan_pointer++;
+                        
+
+
+                        int fi_req = disks[d].units[u].number_unfi_req;
+                        int p = disks[d].units[u].partition_id;
+                        if (fi_req > 0) {
+                            disks[d].partitions[p].req_u_number--;
+                        }
+                        disks[d].partitions[disks[d].units[u].partition_id].num_req -= fi_req;//清空unit其中未读取的任务
+                        disks[d].units[u].number_unfi_req = 0; //清空unit其中未读取的任务
+                        for (int k = 0; k < REP_NUM - 1; k++) {//清空 replica 的 unit其中未读取的任务
+                            int d2 = disks[d].units[u].rep_disk_id[k];
+                            int u2 = disks[d].units[u].rep_unit_id[k];
+                            disks[d2].partitions[disks[d2].units[u2].partition_id].num_req -= fi_req;
+                            disks[d2].units[u2].number_unfi_req = 0;
+                        }
+                        u = disks[d].units[u].nxt_unit_id;
+                    }
+                    else {
+                        break;
+                    }
+                }
+            }
+            else {
+                throw runtime_error("无第四种情况，规划异常");
+            }
+        }
+        if (surplus_token < 0) {
+            throw runtime_error("diskhead规划异常，剩余token<0");
+        }
+
+
+        disks[d].diskheads[h].pointer_location = u;
+        excute_pass_read(d, h, surplus_token, num_actions);
+
+        ////// 赋予该ts的指令
+        //disks[d].diskheads[h].plan_over_mark = num_actions;
+        //disks[d].diskheads[h].action_flow = dft_action_flow[num_actions];
+        //for (int t = 0; t < disks[d].diskheads[h].read_plan_pointer; t++) {
+        //    disks[d].diskheads[h].action_flow[disks[d].diskheads[h].read_plan[t] - 1] = 'r';
+        //}
+
+        //////////////////////////////
+        //
+        //// 更新request状态
+        //if (disks[d].diskheads[h].read_plan_pointer > 0) {
+        //    update_request_status(d, h);
+        //}
+        //////////////////////////
+    }
+    else {
+        disks[d].diskheads[h].action_flow = "#\n";
+    }
+
+    
+
+
+    //int last_pt;
+    //int pt = disks[d].pointer_location[0];
+    //while (true) {
+    //    if (start_pt == pt) {
+    //        break;
+    //    }
+    //    if (start_pt == 1) {
+    //        last_pt = SZ_Disks;
+    //    }
+    //    else {
+    //        last_pt = start_pt - 1;
+    //    }
+    //    if (disks[d].units[start_pt].obj_phase != 0 && disks[d].units[last_pt].number_unfi_req != 0) {
+    //        start_pt--;
+    //        if (start_pt == 0) {
+    //            start_pt = SZ_Disks;
+    //        }
+    //    }
+    //    else {
+    //        break;
+    //    }
+    //}
+    //// 从start_pt开始检查接下来有请求的request数量
+    //int num_actions = 0;
+    //int token_left = Num_Tokens;
+    //while (pt != start_pt) {
+    //    num_actions++;
+    //    pt++;
+    //    if (pt > SZ_Disks) {
+    //        pt = 1;
+    //    }
+    //    token_left--;
+    //}
+    ////disks[d].pointer_location = pt;
+
+    //int still_can_continuous_read = calc_max_continuous_read(token_left);
+    //int least_num_unfi_req_unit = still_can_continuous_read * 1 + 1;
+    //int num_unfi_req_unit = 0;
+    //for (int v = 0; v < still_can_continuous_read; v++) {
+    //    int u = v + pt;
+    //    if (u >= SZ_Disks) {
+    //        u -= SZ_Disks;
+    //    }
+    //    if (disks[d].units[u].number_unfi_req > 0) {
+    //        num_unfi_req_unit++;
+    //    }
+    //}
+    //if (num_unfi_req_unit >= least_num_unfi_req_unit) {
+    //    // continuous read
+    //    execute_continuous_read(d, token_left, pt, num_actions);
+    //}
+    //else {
+    //    // pass read
+    //    execute_pass_read(d, token_left, pt, num_actions);
+    //}
+}
+
+
+
+void execute_cycle_part_to_loop(ReadingLoop* current_loop) {
+
+    (*current_loop).part_num_105ts_req.push_back((*current_loop).part_num_105ts_req[0]);
+    (*current_loop).part_ts_ratio.push_back((*current_loop).part_ts_ratio[0]);
+    (*current_loop).part_sequence.push_back((*current_loop).part_sequence[0]);
+    (*current_loop).part_num_105ts_req.erase((*current_loop).part_num_105ts_req.begin());
+    (*current_loop).part_ts_ratio.erase((*current_loop).part_ts_ratio.begin());
+    (*current_loop).part_sequence.erase((*current_loop).part_sequence.begin());
+}
+
+void execute_cancel_part_to_loop(ReadingLoop* current_loop, int d, int p) {
+    (*current_loop).total_num_105ts_req -= (*current_loop).part_num_105ts_req[0];
+    (*current_loop).total_ts_ratio -= (*current_loop).part_ts_ratio[0];
+    (*current_loop).part_num_105ts_req.erase((*current_loop).part_num_105ts_req.begin());
+    (*current_loop).part_ts_ratio.erase((*current_loop).part_ts_ratio.begin());
+    (*current_loop).part_sequence.erase((*current_loop).part_sequence.begin());
+    (*current_loop).loop_sz--;
+    disks[d].part_activated[p] = false;
+    disks[d].partitions[p].can_accept_new_req = false;
+}
+
+void execute_add_part_to_loop(ReadingLoop* current_loop, int d, int p) {
+    (*current_loop).part_sequence.push_back(p);
+    double plus_num_req = disks[d].partitions[p].num_following_105_ts_requests;
+    (*current_loop).part_num_105ts_req.push_back(plus_num_req);
+    (*current_loop).total_num_105ts_req += plus_num_req;
+    double plus_reading_ts_ratio = disks[d].partitions[p].estimating_ts_ratio_for_reading;
+    (*current_loop).part_ts_ratio.push_back(plus_reading_ts_ratio);
+    (*current_loop).total_ts_ratio += plus_reading_ts_ratio;
+    (*current_loop).loop_sz++;
+    disks[d].part_activated[p] = true;
+}
+
+void concider_exchange_part_to_loop(ReadingLoop current_loop, int d, bool* can_exchange, int* exchange_part, vector<size_t> part_iter_sequence) {
+    double minus_ts_ratio = current_loop.part_ts_ratio[0];
+    for (int i = 0; i < num_total_tag_part; i++) {
+        int p = part_iter_sequence[i];
+        if (disks[d].part_activated[p]) {
+            continue;
+        }
+        double plus_ts_ratio = disks[d].partitions[p].estimating_ts_ratio_for_reading;
+        if (current_loop.total_ts_ratio - minus_ts_ratio+plus_ts_ratio>=1){
+            continue;
+        }
+        double lose_value = current_loop.part_num_105ts_req[0] * (1 - current_loop.total_ts_ratio / 2);
+        double gain_value = (current_loop.total_num_105ts_req - current_loop.part_num_105ts_req[0]) * current_loop.part_ts_ratio[0] / 2;
+
+        lose_value += current_loop.total_num_105ts_req * plus_ts_ratio / 2;
+        gain_value += disks[d].partitions[p].num_following_105_ts_requests * (1 - (plus_ts_ratio + current_loop.total_ts_ratio) / 2);
+
+        if (gain_value - lose_value > accept_exchange_value_threshold) {
+            *can_exchange = true;
+            *exchange_part = p;
+            break;
+        }
+    }
+}
+
+void concider_cancel_part_to_loop(ReadingLoop current_loop, bool* can_cancel) {
+    //判断是否增加分数
+    double minus_ts_ratio = current_loop.part_ts_ratio[0];
+    double lose_value = current_loop.part_num_105ts_req[0] * (1 - current_loop.total_ts_ratio / 2);
+    double gain_value = (current_loop.total_num_105ts_req - current_loop.part_num_105ts_req[0]) * current_loop.part_ts_ratio[0] / 2;
+    if (gain_value - lose_value > accept_cancel_value_threshold) {
+        *can_cancel = true;
+    }
+    else {
+        *can_cancel = false;
+    }
+}
+
+void concider_add_part_to_loop(ReadingLoop current_loop, Partition part, bool* can_add, double* add_plus_value) {
+    if (current_loop.total_ts_ratio + part.estimating_ts_ratio_for_reading < 1) {
+        //判断是否增加分数
+        double plus_ts_ratio = part.estimating_ts_ratio_for_reading;
+        double lose_value = current_loop.total_num_105ts_req * plus_ts_ratio / 2;
+        double gain_value = part.num_following_105_ts_requests * (1 - (plus_ts_ratio + current_loop.total_ts_ratio) / 2);
+        // gain_value 大于 lose value 超过一定分数，则加入
+        if (gain_value - lose_value > accept_add_value_threshold) {
+            *can_add = true;
+            *add_plus_value = gain_value - lose_value;
+        }
+        else {
+            *can_add = false;
+        }
+    }
+    else {
+        *can_add = false;
+    }
+}
+
+/////////////////  对象读取操作（子函数的子函数） 估算 每个disk每个partition在接下来105ts内request总数 和 一个磁针读取part所需要的时间
+void estimate_part_num_request_and_time_for_read() {
+    for (int d = 0; d < Num_Disks; d++) {
+        for (int p = 1; p <= num_total_tag_part; p++) {
+            // 估算part中有多少带有request的unit
+            disks[d].partitions[p].num_u_with_req = 0;
+            for (int t = 0; t < Num_Tags; t++) {
+                // 估算part中有多少request
+                disks[d].partitions[p].num_following_105_ts_requests += disks[d].partitions[p].num_tag_units[t] * next_105_tag_req_per_unit[t];
+                if (next_105_tag_req_per_unit[t] < 1) {
+                    disks[d].partitions[p].num_u_with_req += disks[d].partitions[p].num_tag_units[t] * next_105_tag_req_per_unit[t];
+                }
+                else {
+                    disks[d].partitions[p].num_u_with_req += disks[d].partitions[p].num_tag_units[t];
+                }
+            }
+            // 估算一个磁头读取该part需要的时间
+            disks[d].partitions[p].estimating_ts_for_reading = double(disks[d].partitions[p].occupied_u_number) / max_continuous_read + 1;
+            double with_req_rate = disks[d].partitions[p].num_u_with_req / disks[d].partitions[p].occupied_u_number;
+            if (with_req_rate < unfi_req_unit_rate_for_continuous_read) {
+                disks[d].partitions[p].estimating_ts_for_reading *= with_req_rate / unfi_req_unit_rate_for_continuous_read;
+            }
+            disks[d].partitions[p].estimating_ts_ratio_for_reading = disks[d].partitions[p].estimating_ts_for_reading / 100; // 100 是容错 可以更改，不超过105
+            // 估算 上报任务量与读取时间的比值
+            disks[d].partitions[p].requests_time_ratio = disks[d].partitions[p].num_following_105_ts_requests / disks[d].partitions[p].estimating_ts_for_reading;
+        }
+    }
+}
+
+//////////////////  对象读取操作（子函数） 规划磁盘指针动作
+void plan_disk_pointer_loop() {
+
+    //STEP 1: 估算 每个disk每个partition在接下来105ts内request总数 和 一个磁针读取part所需要的时间
+    estimate_part_num_request_and_time_for_read();
+
+    //STEP 2: 推进每个disk head 的 reading loop
+    for (int d = 0; d < Num_Disks; d++) {
+        // 考虑在loop中新增part
+        vector<double> part_req_u_rho;
+        part_req_u_rho.resize(num_total_tag_part);
+        for (int p = 1; p <= num_total_tag_part; p++) {
+            part_req_u_rho[p - 1] = disks[d].partitions[p].requests_time_ratio;
+        }
+        vector<size_t> part_iter_sequence = sort_indexes(part_req_u_rho, false);
+        for (int p = 0; p < num_total_tag_part; p++) {
+            part_iter_sequence[p]++;
+        }
+        for (int q = 0; q < num_total_tag_part; q++) {
+            int p = part_iter_sequence[q];
+            if (disks[d].part_activated[p]) {
+                continue;
+            }
+            int diskhead_sequence[2] = { 0,1 };
+            if (disks[d].diskheads[0].readingloop.total_ts_ratio > disks[d].diskheads[1].readingloop.total_ts_ratio) {
+                diskhead_sequence[0] = 1;
+                diskhead_sequence[1] = 0;
+            }
+            bool can_add = false;
+            int add_h = -1;
+            double add_plus_value = 0.0;
+            for (int i = 0; i < 2; i++) {
+                int h = diskhead_sequence[i];
+
+                if (disks[d].diskheads[h].readingloop.loop_sz == 0) {
+                    ///// 初次新增part到loop中
+                    execute_add_part_to_loop(&disks[d].diskheads[h].readingloop, d, p);
+                    break;
+                }
+
+                bool can_add1 = false;
+                double add_plus_value1 = 0.0;
+                concider_add_part_to_loop(disks[d].diskheads[h].readingloop, disks[d].partitions[p], &can_add1, &add_plus_value1);
+                if (can_add1 && add_plus_value1>add_plus_value) {
+                    can_add = true;
+                    add_h = h;
+                    add_plus_value = add_plus_value1;
+                }
+            }
+            if (can_add) {
+                execute_add_part_to_loop(&disks[d].diskheads[add_h].readingloop, d, p);
+            }
+        }
+
+        /////////////////////  推进磁头
+        for (int h = 0; h < DISK_HEAD_NUM; h++) {
+            int token_left = Num_Tokens;
+            int p = disks[d].diskheads[h].current_task_part;
+            
+            bool can_find_request = false;
+            int pt = disks[d].diskheads[h].pointer_location;
+            int num_actions = 0;
+            if (disks[d].diskheads[h].mission_started && disks[d].units[pt].partition_id == p) {
+                int last_u = disks[d].partitions[p].last_unit;
+                int need_to_pass = 0;
+                for (int u = pt; u <= last_u; u++) {
+                    if (disks[d].units[u].number_unfi_req == 0) {
+                        need_to_pass++;
+                    }
+                    else {
+                        can_find_request = true;
+                        num_actions = need_to_pass;
+                        pt = u;
+                        token_left -= num_actions;
+                        break;
+                    }
+                }
+                if (!can_find_request) {
+                    execute_cycle_part_to_loop(&disks[d].diskheads[h].readingloop);
+                    disks[d].diskheads[h].mission_started = false;
+                    disks[d].diskheads[h].current_task_part = disks[d].diskheads[h].readingloop.part_sequence[0];
+                    p = disks[d].diskheads[h].current_task_part;
+                }
+            }
+            
+            if (!can_find_request) {
+                for (int i = 0; i < disks[d].diskheads[h].readingloop.loop_sz; i++) {
+                    if (disks[d].partitions[p].num_req != 0) {
+                        can_find_request = true;
+                        break;
+                    }
+                    else {
+                        execute_cycle_part_to_loop(&disks[d].diskheads[h].readingloop);
+                        disks[d].diskheads[h].mission_started = false;
+                        disks[d].diskheads[h].current_task_part = disks[d].diskheads[h].readingloop.part_sequence[0];
+                        p = disks[d].diskheads[h].current_task_part;
+                    }
+                }
+            }
+
+            if(!can_find_request){
+                disks[d].diskheads[h].action_flow = "#\n";
+                continue;
+            }
+            
+
+
+            // 执行jump或pass 抵达任务区
+            if (!disks[d].diskheads[h].mission_started) {
+                disks[d].diskheads[h].mission_started = true;
+                int start_u = 0;
+                int first_u = disks[d].partitions[p].first_unit;
+                int last_u = disks[d].partitions[p].last_unit;
+                for (int u = first_u; u <= last_u; u++) {
+                    if (disks[d].units[u].number_unfi_req > 0) {
+                        start_u = u;
+                        break;
+                    }
+                }
+                if (start_u - pt > token_left - 64 || start_u - pt < 0) {
+                    // 需要执行jump
+                    disks[d].diskheads[h].execute_jump = true;
+                    disks[d].diskheads[h].jump_unit = start_u;
+                    disks[d].diskheads[h].pointer_location = start_u;
+                    continue;
+                }
+                else {
+                    num_actions = start_u - pt;
+                    pt = start_u;
+                    token_left -= num_actions;
+                }
+
+            }
+
+            
+            // a* search 推移指针前进;
+            a_star_search_diskhead_actionflow(d, h, pt, token_left, num_actions);
+            pt = disks[d].diskheads[h].pointer_location;
+            int current_task_last_u = disks[d].partitions[p].last_unit;
+            if (pt >= current_task_last_u) {
+                // 当前p完成
+                if (disks[d].diskheads[h].cancel_current_part) {
+                    // 取消当前p
+                    execute_cancel_part_to_loop(&disks[d].diskheads[h].readingloop, d, p);
+                    disks[d].diskheads[h].cancel_current_part = false;
+                    if (disks[d].diskheads[h].exchange_current_part) {
+                        // 置换当前p
+                        disks[d].diskheads[h].exchange_current_part = false;
+                        int ep = disks[d].diskheads[h].exchange_part;
+                        execute_add_part_to_loop(&disks[d].diskheads[h].readingloop, d, ep);
+                        disks[d].partitions[ep].can_accept_new_req = true;
+                    }
+                }
+                else {
+                    // 不取消当前p, 完成当前p，将当前p推至队尾
+                    execute_cycle_part_to_loop(&disks[d].diskheads[h].readingloop);
+                }
+
+                // 接取下一p任务
+                disks[d].diskheads[h].current_task_part = disks[d].diskheads[h].readingloop.part_sequence[0];
+                disks[d].diskheads[h].mission_started = false;
+                
+                // 考虑是否取消该part
+                bool can_cancel = false;
+                concider_cancel_part_to_loop(disks[d].diskheads[h].readingloop, &can_cancel);
+                if (can_cancel) {
+                    disks[d].diskheads[h].cancel_current_part = true;
+                }
+                else {
+                    // 考虑是否替代该part
+                    bool can_exchange = false;
+                    int exchange_part = 0;
+                    concider_exchange_part_to_loop(disks[d].diskheads[h].readingloop, d, &can_exchange, &exchange_part, part_iter_sequence);
+                    if (can_exchange) {
+                        disks[d].diskheads[h].cancel_current_part = true;
+                        disks[d].diskheads[h].exchange_current_part = true;
+                        disks[d].diskheads[h].exchange_part = exchange_part;
+                        disks[d].part_activated[exchange_part] = true;
+                    }
+                }
             }
         }
     }
 }
 
-//////////////////  对象读取操作（子函数） 规划磁盘指针动作                        尚未更新为复赛版本！！！！！！！！！！！！！
-void plan_disk_pointer() {
 
-    vector<bool> diskhead_have_planned;
-    diskhead_have_planned.resize(Num_Disks);
-    vector<bool> disk_need_jump;
-    vector<int> head_start_unit;
-    while (true) {
-        // 决策适宜进行jump的disk
-        bool did_new_plan = false;
-        give_best_diskhead_plan(&disk_need_jump, &head_start_unit, &diskhead_have_planned, &did_new_plan);
-        if (!did_new_plan) {
-            // 没有新的磁盘头行为被规划，执行所有的jump.
-            execute_diskhead_jump(disk_need_jump, head_start_unit, diskhead_have_planned);
-            break;
+
+
+void plan_disk_pointer_init() {
+    // 初阶段规划磁针，寻找request所在
+    for (int d = 0; d < Num_Disks; d++) {
+        for (int h = 0; h < DISK_HEAD_NUM;h++) {
+            int c_p = disks[d].diskheads[h].current_task_part;
+            if (c_p != 0 && disks[d].partitions[c_p].num_req == 0) {
+                disks[d].diskheads[h].currently_free = true;
+                disks[d].partitions[c_p].on_reading = false;
+            }
+            int pt = disks[d].diskheads[h].pointer_location;
+            if (disks[d].units[pt].partition_id != c_p) {
+                disks[d].diskheads[h].currently_free = true;
+                disks[d].partitions[c_p].on_reading = false;
+            }
+            // 磁针超出管理范围，使其空闲
+            if (disks[d].diskheads[h].pointer_location > disks[d].partitions[num_total_tag_part].last_unit) {
+                disks[d].diskheads[h].currently_free = true;
+            }
+
+            if (disks[d].diskheads[h].currently_free) {
+                // 磁针空闲，寻找request
+                
+                int current_p = disks[d].units[pt].partition_id;
+                if (current_p > num_total_tag_part) {
+                    current_p = 1;
+                }
+
+                bool found_req = false;//用于判断是否找到req;
+                for (int q = 0; q < num_total_tag_part; q++) {
+                    int p = ((current_p + q - 1) % (num_total_tag_part)) + 1;
+                    if (disks[d].partitions[p].num_req > 0 && !disks[d].partitions[p].on_reading) {
+                        // 找到request_u
+                        found_req = true;
+                        disks[d].diskheads[h].current_task_part = p;
+                        int req_u = 0;
+                        int first_u = disks[d].partitions[p].first_unit;
+                        int last_u = disks[d].partitions[p].last_unit;
+                        for (int u = first_u; u <= last_u; u++) {
+                            if (disks[d].units[u].number_unfi_req > 0) {
+                                req_u = u;
+                                break;
+                            }
+                        }
+                        // 判断是否需要jump到该位置
+                        if (req_u - pt >= 0 && req_u - pt <= Num_Tokens - 64) {
+                            //直接read过去;
+                            excute_pass_read(d, h, Num_Tokens, 0);
+                        }
+                        else {
+                            // jump 到该位置
+                            disks[d].diskheads[h].execute_jump = true;
+                            disks[d].diskheads[h].jump_unit = req_u;
+                            disks[d].diskheads[h].pointer_location = req_u;
+                            disks[d].diskheads[h].currently_free = false;
+                            disks[d].diskheads[h].current_partition = p;
+                        }
+                        disks[d].partitions[p].on_reading = true;
+                        break;
+                    }
+                }
+                // 如果没找到req，不执行任何动作
+                if (!found_req) {
+                    disks[d].diskheads[h].action_flow = "#\n";
+                }
+                continue;
+            }
+            else {
+                // 磁针不空闲 执行pass和read寻找request
+                excute_pass_read(d, h, Num_Tokens, 0);
+            }
         }
-        // 若这一个循环执行过磁盘头行为规划，则unit状态可能被更新，需要重新对jump进行规划，直到循环中没有执行新的磁盘头规划
     }
 }
 
-////////////////////  对象读取操作（子函数） 存储request                        尚未更新为复赛版本！！！！！！！！！！！！！
+//////////////////////  对象读取操作（子函数的子函数） 预测每个tag在接下来105ts内会有多少个request
+void predict_next_105_ts_tag_req() {
+
+    int last_50_pt1 = last_50_pt;
+    int last_100_pt1 = last_100_pt;
+    int last_150_pt1 = current_pt;
+    for (int i = 0; i < 50; i++) {
+        for (int t = 0; t < Num_Tags; t++) {
+            avg_last_0_50_req[t] += last_150_ts_tag_req[t][last_50_pt1];
+            avg_last_50_100_req[t] += last_150_ts_tag_req[t][last_100_pt1];
+            avg_last_100_150_req[t] += last_150_ts_tag_req[t][last_150_pt1];
+        }
+
+        last_50_pt1++;
+        last_50_pt1 %= 150;
+        last_100_pt1++;
+        last_100_pt1 %= 150;
+        last_150_pt1++;
+        last_150_pt1 %= 150;
+    }
+
+    for (int t = 0; t < Num_Tags; t++) {
+        avg_last_0_50_req[t] /= 50;
+        avg_last_50_100_req[t] /= 50;
+        avg_last_100_150_req[t] /= 50;
+        current_avg_ts_req_slope[t] += (avg_last_0_50_req[t] - avg_last_50_100_req[t]) / 50;
+        current_avg_ts_req_slope[t] += (avg_last_50_100_req[t] - avg_last_100_150_req[t]) / 50;
+        current_avg_ts_req_slope[t] /= 2;
+        next_105_tag_req[t] = ceil((avg_last_0_50_req[t] + current_avg_ts_req_slope[t] + avg_last_0_50_req[t] + current_avg_ts_req_slope[t] * 105) * 105 / 2);
+        next_105_tag_req_per_unit[t] = double(next_105_tag_req[t]) / num_tag_object[t];//计算得到每个tag在接下来105个ts的tag_u可以获得多少req
+        if (next_105_tag_req[t] < 0) {
+            next_105_tag_req[t] = 0;
+        }
+    }
+}
+
+//////////////////////  对象读取操作（子函数） 存储request
 void record_request() {
     int n_read;
     if (debug_mode) {
@@ -794,6 +2051,8 @@ void record_request() {
         request[request_id].prev_id = object[object_id].last_request_point;
         request[request_id].arrival_ts = ts;
         int sz = object[object_id].size;
+        int t = object[object_id].tag;
+        currently_tag_unfi_req[t - 1] += sz;
         request[request_id].sz = sz;
         for (int j = 0; j < sz; j++) {
             request[request_id].have_read[j] = false;
@@ -806,49 +2065,75 @@ void record_request() {
         for (int i = 0; i < REP_NUM; i++) {
             int d = object[object_id].replica_disk[i];
             int p = object[object_id].replica_partition[i];
-            disks[d].partitions[p].num_req += object[object_id].size;
+            disks[d].partitions[p].num_req += sz;
+            // 更新disk part req rho
+            disks[d].partitions[p].req_rho += double(sz) / disks[d].partitions[p].sz;
             for (int j = 0; j < object[object_id].size; j++) {
                 int u = object[object_id].store_units[i][j];
+                if (disks[d].units[u].number_unfi_req == 0) {
+                    disks[d].partitions[p].req_u_number++;
+                }
                 disks[d].units[u].number_unfi_req++;
             }
         }
 
+        // 更新 last_150_ts_tag_req
+        last_150_ts_tag_req[t - 1][current_pt]++;
         // 更新 request_lose_value_loop
         lose_value_req_loop[time_pointer][loop_pointer[time_pointer]] = request_id;
         loop_pointer[time_pointer]++;
     }
+    // 更新 current pt 、last 50和last 100 pt
+    current_pt++;
+    current_pt %= 150;
+    last_50_pt++;
+    last_50_pt %= 150;
+    last_100_pt++;
+    last_100_pt %= 150;
 }
 
-/////////////////////// 对象读取操作(母函数) read_action                        尚未更新为复赛版本！！！！！！！！！！！！！
+///////////////////////// 对象读取操作(母函数) read_action
 void read_action()
 {
-
     // 存储request
     record_request();
+ 
+    if (ts > 150) {
+        // 预测接下来105ts 每个tag 和unit会接收到request的数量
+        predict_next_105_ts_tag_req();
 
-    // 规划磁盘指针动作
-    plan_disk_pointer();
+        // 规划磁盘指针动作(赋予循环)
+        plan_disk_pointer_loop();
+
+    }
+    else {
+        // 初阶段规划磁盘指针 
+        plan_disk_pointer_init();
+
+    }
 
     // 执行指针动作
     print_pointer_action_and_finished_requsets();
-
 }
 
-/////////////////////// 对象写入（子函数） 对象写入后处理                        尚未更新为复赛版本！！！！！！！！！！！！！
-void postprocess_object_write(int obj_id) {
-    // 更新unit相应replica相位和其余信息
-    for (int i = 0; i < REP_NUM; i++) {
-        int d = object[obj_id].replica_disk[i];
-        for (int s = 0; s < object[obj_id].size; s++) {
-            int u = object[obj_id].store_units[i][s];
-        }
-    }
-}
+//////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////  WRITE  /////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////
 
-//////////////////////  对象写入（子函数）  执行对象写入                        尚未更新为复赛版本！！！！！！！！！！！！！
-void execute_object_write(int obj_id, vector<int> w_disk_list, vector<int> w_part_list, vector<vector<int>> w_unit_list, bool over_write) {
+//////////////////////  对象写入（子函数）  执行对象写入
+void execute_object_write(int obj_id, vector<int> w_disk_list, vector<int> w_part_list, vector<vector<int>> w_unit_list, bool over_write, bool continuous_write) {
     //取出object信息
     int sz = object[obj_id].size;
+    int tag = object[obj_id].tag;
+    if (sz > 3 && continuous_write) {
+        if (over_write) {
+            over_write = false;
+        }
+    }
+
+    num_tag_unit[tag - 1] += sz;
+    num_tag_object[tag - 1]++;
+
     for (int r = 0; r < REP_NUM; r++) {
         int d = w_disk_list[r];
         int p = w_part_list[r];
@@ -867,10 +2152,12 @@ void execute_object_write(int obj_id, vector<int> w_disk_list, vector<int> w_par
             disks[d].units[u].occupied = true;  // 占据该unit
             disks[d].units[u].obj_id = obj_id;  // 更新占据该unit的object id
             disks[d].units[u].obj_phase = v;    // 更新占据该unit的object phase
-            //disks[d].units[u].value_per_req = request_sz_unit_value[sz - 1]; //计算该unit每个任务的分数
             object[obj_id].store_units[r][v] = u;// 更新object被存储disk上的unit位置
         }
+
         disks[d].partitions[p].occupied_u_number += sz; //更新partition已被写入的内存
+        disks[d].partitions[p].num_tag_units[tag - 1] += sz;
+        //disks[d].partitions[p].occupied_tag_u_number[tag - 1] += sz;
 
         //更新写盘指针位置
         int pt = 0;
@@ -917,25 +2204,25 @@ void execute_object_write(int obj_id, vector<int> w_disk_list, vector<int> w_par
     }
 }
 
-//////////////////////  对象写入（子函数的子函数）  判断对象能否写入一个partition（无需连续）                        尚未更新为复赛版本！！！！！！！！！！！！！
-void judge_object_write_in_partition(int d, int p, int sz, bool* can_write, vector<int>* write_unit_list) {
+//////////////////////  对象写入（子函数的子函数）  判断对象能否写入一个partition（无需连续）
+void judge_object_write_in_partition(int d, int p, int sz, bool* can_write, vector<int>* w_disk_list, vector<int>* w_part_list, vector<vector<int>>* w_unit_list) {
     (*can_write) = false;
-    (*write_unit_list).clear();
-    (*write_unit_list).resize(sz);
+    vector<int> write_unit_list;
+    write_unit_list.resize(sz);
     int pt = 0;
     bool reverse_write = disks[d].partitions[p].reverse_write;
 
     int first_u = disks[d].partitions[p].first_unit;
     int last_u = disks[d].partitions[p].last_unit;
 
-    int num_free_unit = 0; // 记录连续free的unit数量，用于判断能否完整存储一个object
+    int num_free_unit = 0; // 记录free的unit数量，用于判断能否完整存储一个object
 
     for (int u = first_u; u <= last_u; u++) {
         if (disks[d].units[u].occupied) {
             continue;
         }
         else {
-            (*write_unit_list)[num_free_unit] = u;
+            write_unit_list[num_free_unit] = u;
             num_free_unit++;
             if (num_free_unit == sz) {
                 *can_write = true;
@@ -943,11 +2230,34 @@ void judge_object_write_in_partition(int d, int p, int sz, bool* can_write, vect
             }
         }
     }
+    if (*can_write) {
+        (*w_disk_list)[0] = d;
+        (*w_part_list)[0] = p;
+        (*w_unit_list)[0] = write_unit_list;
+        for (int j = 0; j < REP_NUM - 1; j++) {
+            for (int v = 0; v < sz; v++) {
+                int u = write_unit_list[v];
+                (*w_disk_list)[j + 1] = disks[d].units[u].rep_disk_id[j];
+                (*w_part_list)[j + 1] = disks[d].units[u].rep_part_id[j];
+                (*w_unit_list)[j + 1][v] = disks[d].units[u].rep_unit_id[j];
+            }
+        }
+    }
 }
 
-//////////////////////  对象写入（子函数的子函数）  判断对象能否连续写入该partition                        尚未更新为复赛版本！！！！！！！！！！！！！
-void judge_object_continuous_write(int d, int p, bool over_write, int sz, bool* can_write, int* start_write_unit) {
+//////////////////////  对象写入（子函数的子函数）  判断对象能否连续写入该partition  
+void judge_object_continuous_write(int d, int p, bool over_write, int sz, bool* can_write, vector<int>* w_disk_list, vector<int>* w_part_list, vector<vector<int>>* w_unit_list) {
     (*can_write) = false;
+    // 对于sz>3的大obj，逆写
+    if (sz > 3) {
+        if (over_write) {
+            over_write = false;
+        }
+        else {
+            over_write = true;
+        }
+    }
+
     int pt = 0;
     if (over_write) {
         pt = disks[d].partitions[p].reverse_pointer;
@@ -1001,12 +2311,24 @@ void judge_object_continuous_write(int d, int p, bool over_write, int sz, bool* 
         }
     }
     if (*can_write) {
-        *start_write_unit = start_u;
+        // 给出所有的replica
+        (*w_disk_list)[0] = d;
+        (*w_part_list)[0] = p;
+        for (int v = 0; v < sz; v++) {
+            (*w_unit_list)[0][v] = start_u + v;
+        }
+        for (int j = 0; j < REP_NUM - 1; j++) {
+            (*w_disk_list)[j + 1] = disks[d].units[start_u].rep_disk_id[j];
+            (*w_part_list)[j + 1] = disks[d].units[start_u].rep_part_id[j];
+            for (int v = 0; v < sz; v++) {
+                (*w_unit_list)[j + 1][v] = disks[d].units[start_u].rep_unit_id[j] + v;
+            }
+        }
     }
 }
 
-//////////////////////  对象写入（子函数）寻找可写盘的位置                        尚未更新为复赛版本！！！！！！！！！！！！！
-void find_space_for_write(int id, int size, int tag, bool* can_write, vector<int>* w_disk_list, vector<int>* w_part_list, vector<vector<int>>* w_unit_list, bool* over_write) {
+//////////////////////  对象写入（子函数）寻找可写盘的位置
+void find_space_for_write(int id, int size, int tag, bool* can_write, vector<int>* w_disk_list, vector<int>* w_part_list, vector<vector<int>>* w_unit_list, bool* over_write, bool* continuous_write) {
 
     *can_write = false;
     (*w_disk_list).resize(REP_NUM);
@@ -1015,122 +2337,49 @@ void find_space_for_write(int id, int size, int tag, bool* can_write, vector<int
     for (int i = 0; i < REP_NUM; i++) {
         (*w_unit_list)[i].resize(size);
     }
-    // 生成一个随机遍历序列
-    vector<int> rand_sequence;
-    rand_sequence.resize(tag_to_partition[tag].disk_list.size());
-    for (int r = 0; r < tag_to_partition[tag].disk_list.size(); r++) {
-        rand_sequence[r] = r;
+
+    // 优先遍历spare unit较多的disk
+    vector<int> num_disk_occupied_units;
+    num_disk_occupied_units.resize(Num_Disks);
+    for (int i = 0; i < Num_Disks; i++) {
+        num_disk_occupied_units[i] = SZ_Disks - disks[i].num_spare_units;
     }
-    random_shuffle(rand_sequence.begin(), rand_sequence.end());
+    vector<size_t> iter_sequence = sort_indexes(num_disk_occupied_units);
+
+    int t = tag - 1;
     //////////////////////////// 第一轮寻找  常规写入
-    for (int i = 0; i < tag_to_partition[tag].disk_list.size(); i++) {
-        int r = rand_sequence[i];
-        int d = tag_to_partition[tag].disk_list[r];
-        int p = tag_to_partition[tag].partition_list[r];
-        if (disks[d].partitions[p].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
-            continue;
-        }
-        int start_write_unit;
-        judge_object_continuous_write(d, p, false, size, can_write, &start_write_unit);
-        if (*can_write) {
-            *over_write = false;
-            // 给出所有的replica
-            (*w_disk_list)[0] = d;
-            (*w_part_list)[0] = p;
-            for (int v = 0; v < size; v++) {
-                (*w_unit_list)[0][v] = start_write_unit + v;
-            }
-            for (int j = 0; j < REP_NUM - 1; j++) {
-                (*w_disk_list)[j + 1] = disks[d].units[start_write_unit].rep_disk_id[j];
-                (*w_part_list)[j + 1] = disks[d].units[start_write_unit].rep_part_id[j];
-                for (int v = 0; v < size; v++) {
-                    (*w_unit_list)[j + 1][v] = disks[d].units[start_write_unit].rep_unit_id[j] + v;
-                }
-            }
-            break;
-        }
-    }
-    //////////////////////////// 第二轮寻找  超区写入
-    if (!(*can_write)) {
-        for (int i = 0; i < tag_to_partition[tag].disk_list.size(); i++) {
-            int r = rand_sequence[i];
-            int d = tag_to_partition[tag].disk_list[r];
-            int p = tag_to_partition[tag].over_write_partition_list[r];
-            if (disks[d].partitions[p].full) {
+    for (int i = 0; i < Num_Disks; i++) {
+        int d = iter_sequence[i];
+        for (int q = 0; q < REP_NUM; q++) {
+            int p = tag_to_partition[t].partition_list[q];
+            if (disks[d].partitions[p].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
                 continue;
             }
-            int start_write_unit;
-            judge_object_continuous_write(d, p, true, size, can_write, &start_write_unit);
+            judge_object_continuous_write(d, p, false, size, can_write, w_disk_list, w_part_list, w_unit_list);
             if (*can_write) {
-                *over_write = true;
-                // 给出所有的replica
-                (*w_disk_list)[0] = d;
-                (*w_part_list)[0] = p;
-                for (int v = 0; v < size; v++) {
-                    (*w_unit_list)[0][v] = start_write_unit + v;
-                }
-                for (int j = 0; j < REP_NUM - 1; j++) {
-                    (*w_disk_list)[j + 1] = disks[d].units[start_write_unit].rep_disk_id[j];
-                    (*w_part_list)[j + 1] = disks[d].units[start_write_unit].rep_part_id[j];
-                    for (int v = 0; v < size; v++) {
-                        (*w_unit_list)[j + 1][v] = disks[d].units[start_write_unit].rep_unit_id[j] + v;
-                    }
-                }
+                *continuous_write = true;
+                *over_write = false;
                 break;
             }
         }
+        if (*can_write) {
+            break;
+        }
     }
-    //////////////////////////// 第三轮寻找  尝试连续写入无tag标签的分区
-    // 优先spare_unit较多的disk
-    vector<int> n_spare_u;
-    vector<int> disk_sequence1;
-    if (!(*can_write)) {
-        n_spare_u.resize(Num_Disks);
-        disk_sequence1.resize(Num_Disks);
-        for (int i = 0; i < Num_Disks; i++) {
-            n_spare_u[i] = disks[i].num_spare_units;
-        }
-        vector<size_t> sort_idx;
-        sort_idx = sort_indexes(n_spare_u);
-        for (int i = 0; i < Num_Disks; i++) {
-            disk_sequence1[i] = sort_idx[Num_Disks - 1 - i];
-        }
-        random_shuffle(disk_sequence.begin(), disk_sequence.end());
-        vector<int> w_unit_list1;
 
+    //////////////////////////// 第二轮寻找  尝试非连续写入相应tag标签的分区
+    if (!(*can_write)) {
         for (int i = 0; i < Num_Disks; i++) {
-            int d = disk_sequence1[i];
-            for (int p = 1; p < disks[d].partitions.size(); p++) {
-                if (!disks[d].partitions[p].unassigned) {
+            int d = iter_sequence[i];
+            for (int q = 0; q < REP_NUM; q++) {
+                int p = tag_to_partition[t].partition_list[q];
+                if (disks[d].partitions[p].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
                     continue;
                 }
-                if (disks[d].partitions[0].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
-                    continue;
-                }
-                int start_write_unit;
-                judge_object_continuous_write(d, p, false, size, can_write, &start_write_unit);
+                judge_object_write_in_partition(d, p, size, can_write, w_disk_list, w_part_list, w_unit_list);
                 if (*can_write) {
-                    *over_write = true;
-                    // 给出所有的replica
-                    (*w_disk_list)[0] = d;
-                    (*w_part_list)[0] = p;
-                    for (int v = 0; v < size; v++) {
-                        (*w_unit_list)[0][v] = start_write_unit + v;
-                        if ((*w_unit_list)[0][v] > SZ_Disks) {
-                            (*w_unit_list)[0][v] -= SZ_Disks;
-                        }
-                    }
-                    for (int j = 0; j < REP_NUM - 1; j++) {
-                        (*w_disk_list)[j + 1] = disks[d].units[start_write_unit].rep_disk_id[j];
-                        if ((*w_disk_list)[j + 1] >= 10) {
-                            (*can_write) = false;
-                            break;
-                        }
-                        (*w_part_list)[j + 1] = disks[d].units[start_write_unit].rep_part_id[j];
-                        for (int v = 0; v < size; v++) {
-                            (*w_unit_list)[j + 1][v] = disks[d].units[start_write_unit].rep_unit_id[j] + v;
-                        }
-                    }
+                    *continuous_write = false;
+                    *over_write = false;
                     break;
                 }
             }
@@ -1139,78 +2388,67 @@ void find_space_for_write(int id, int size, int tag, bool* can_write, vector<int
             }
         }
     }
-    //////////////////////////// 第四轮寻找  尝试非连续写入相应tag标签的分区
+
+    //////////////////////////// 第三轮寻找  超区写入
     if (!(*can_write)) {
-        for (int i = 0; i < tag_to_partition[tag].disk_list.size(); i++) {
-            int r = rand_sequence[i];
-            int d = tag_to_partition[tag].disk_list[r];
-            int p = tag_to_partition[tag].partition_list[r];
-            if (disks[d].partitions[p].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
-                continue;
-            }
-            vector<int> w_unit_list1;
-            judge_object_write_in_partition(d, p, size, can_write, &w_unit_list1);
-            if (*can_write) {
-                (*w_disk_list)[0] = d;
-                (*w_part_list)[0] = p;
-                (*w_unit_list)[0] = w_unit_list1;
-                for (int j = 0; j < REP_NUM - 1; j++) {
-                    for (int v = 0; v < size; v++) {
-                        int u = w_unit_list1[v];
-                        (*w_disk_list)[j + 1] = disks[d].units[u].rep_disk_id[j];
-                        (*w_part_list)[j + 1] = disks[d].units[u].rep_part_id[j];
-                        (*w_unit_list)[j + 1][v] = disks[d].units[u].rep_unit_id[j];
-                    }
+        for (int i = 0; i < Num_Disks; i++) {
+            int d = iter_sequence[i];
+            for (int q = 0; q < REP_NUM; q++) {
+                int p = tag_to_partition[t].over_write_partition_list[q];
+                if (disks[d].partitions[p].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
+                    continue;
                 }
+                judge_object_continuous_write(d, p, true, size, can_write, w_disk_list, w_part_list, w_unit_list);
+                if (*can_write) {
+                    *continuous_write = true;
+                    *over_write = true;
+                    break;
+                }
+            }
+            if (*can_write) {
                 break;
             }
         }
     }
-    //////////////////////////// 第五轮寻找  尝试写入其他tag标签的分区
+
+
+
+    //////////////////////////// 第四轮寻找  尝试非连续超区写入其他tag标签的分区
     if (!(*can_write)) {
-        vector<int> tag_iter_sequence;
-        tag_iter_sequence.resize(Num_Tags);
-        for (int i = 0; i < Num_Tags; i++) {
-            tag_iter_sequence[i] = i + 1;
-        }
-        random_shuffle(tag_iter_sequence.begin(), tag_iter_sequence.end());
-        for (int j = 0; j < Num_Tags; j++) {
-            int t = tag_iter_sequence[j];
-            for (int i = 0; i < tag_to_partition[t].disk_list.size(); i++) {
-                int r = rand_sequence[i];
-                int d = tag_to_partition[t].disk_list[r];
-                int p = tag_to_partition[t].partition_list[r];
-                if (d != disk_sequence1[0]) {
-                    // 优先spare_unit较多的disk
-                    continue;
-                }
+        for (int i = 0; i < Num_Disks; i++) {
+            int d = iter_sequence[i];
+            for (int q = 0; q < REP_NUM; q++) {
+                int p = tag_to_partition[t].over_write_partition_list[q];
                 if (disks[d].partitions[p].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
                     continue;
                 }
-                int start_write_unit;
-                judge_object_continuous_write(d, p, false, size, can_write, &start_write_unit);
+                judge_object_write_in_partition(d, p, size, can_write, w_disk_list, w_part_list, w_unit_list);
                 if (*can_write) {
+                    *continuous_write = false;
+                    *over_write = true;
+                    break;
+                }
+            }
+            if (*can_write) {
+                break;
+            }
+        }
+    }
+
+    //////////////////////////// 第五轮寻找  尝试连续写入无tag标签的分区
+    // 优先spare_unit较多的disk
+    if (!(*can_write)) {
+        for (int i = 0; i < Num_Disks; i++) {
+            int d = iter_sequence[i];
+            for (int q = 0; q < REP_NUM; q++) {
+                int p = Num_Tags * REP_NUM + q;
+                if (disks[d].partitions[p].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
+                    continue;
+                }
+                judge_object_continuous_write(d, p, false, size, can_write, w_disk_list, w_part_list, w_unit_list);
+                if (*can_write) {
+                    *continuous_write = true;
                     *over_write = false;
-                    // 给出所有的replica
-                    (*w_disk_list)[0] = d;
-                    (*w_part_list)[0] = p;
-                    for (int v = 0; v < size; v++) {
-                        (*w_unit_list)[0][v] = start_write_unit + v;
-                        if ((*w_unit_list)[0][v] > SZ_Disks) {
-                            (*w_unit_list)[0][v] -= SZ_Disks;
-                        }
-                    }
-                    for (int j = 0; j < REP_NUM - 1; j++) {
-                        (*w_disk_list)[j + 1] = disks[d].units[start_write_unit].rep_disk_id[j];
-                        if ((*w_disk_list)[j + 1] >= 10) {
-                            (*can_write) = false;
-                            break;
-                        }
-                        (*w_part_list)[j + 1] = disks[d].units[start_write_unit].rep_part_id[j];
-                        for (int v = 0; v < size; v++) {
-                            (*w_unit_list)[j + 1][v] = disks[d].units[start_write_unit].rep_unit_id[j] + v;
-                        }
-                    }
                     break;
                 }
             }
@@ -1222,27 +2460,16 @@ void find_space_for_write(int id, int size, int tag, bool* can_write, vector<int
 
     //////////////////////////// 第六轮寻找  写入任意非连续空间
     if (!(*can_write)) {
-        // 优先spare_unit较多的disk
-        vector<int> w_unit_list1;
         for (int i = 0; i < Num_Disks; i++) {
-            int d = disk_sequence1[i];
+            int d = iter_sequence[i];
             for (size_t p = disks[d].partitions.size() - 1; p >= 1; p--) {
                 if (disks[d].partitions[p].full || disks[d].partitions[p].sz - disks[d].partitions[p].occupied_u_number + 1 < size) {
                     continue;
                 }
-                judge_object_write_in_partition(d, p, size, can_write, &w_unit_list1);
+                judge_object_continuous_write(d, p, false, size, can_write, w_disk_list, w_part_list, w_unit_list);
                 if (*can_write) {
-                    (*w_disk_list)[0] = d;
-                    (*w_part_list)[0] = p;
-                    (*w_unit_list)[0] = w_unit_list1;
-                    for (int j = 0; j < REP_NUM - 1; j++) {
-                        for (int v = 0; v < size; v++) {
-                            int u = w_unit_list1[v];
-                            (*w_disk_list)[j + 1] = disks[d].units[u].rep_disk_id[j];
-                            (*w_part_list)[j + 1] = disks[d].units[u].rep_part_id[j];
-                            (*w_unit_list)[j + 1][v] = disks[d].units[u].rep_unit_id[j];
-                        }
-                    }
+                    *continuous_write = false;
+                    *over_write = false;
                     break;
                 }
             }
@@ -1251,9 +2478,10 @@ void find_space_for_write(int id, int size, int tag, bool* can_write, vector<int
             }
         }
     }
+
 };
 
-////////////////////// 对象写入（母函数） write_action                        尚未更新为复赛版本！！！！！！！！！！！！！
+////////////////////// 对象写入（母函数） write_action
 void write_action()
 {
     int n_write;
@@ -1288,26 +2516,23 @@ void write_action()
         object[id].tag = tag;
 
         // 寻找可写入的位置
-        bool can_write, over_write; // 是否可写入  是否超区写盘
+        bool can_write, over_write, continuous_write; // 是否可写入  是否超区写盘  是否连续写入
         vector<int> w_disk_list;
         vector<int> w_part_list;
         vector<vector<int>> w_unit_list;// 盘号 分区号 初始写盘位置
 
-        find_space_for_write(id, size, tag, &can_write, &w_disk_list, &w_part_list, &w_unit_list, &over_write);
+        find_space_for_write(id, size, tag, &can_write, &w_disk_list, &w_part_list, &w_unit_list, &over_write, &continuous_write);
 
         if (can_write) {
             // 顺利找到写入方案
-            execute_object_write(id, w_disk_list, w_part_list, w_unit_list, over_write);
+            execute_object_write(id, w_disk_list, w_part_list, w_unit_list, over_write, continuous_write);
         }
         else {
             // 若未顺利找到写入方案，则需要考虑非连续写入。
             throw runtime_error("未成功写入。");
         }
 
-        //////////   写入完毕，整理信息
-        postprocess_object_write(id);
-
-        ///////// 输出
+        //////////   写入完毕, 输出
         output_cache += to_string(id);
         output_cache += "\n";
         for (int j = 0; j < REP_NUM; j++) {
@@ -1322,7 +2547,11 @@ void write_action()
     fflush(stdout);
 }
 
-////////////////////// 对象删除 delete action                        尚未更新为复赛版本！！！！！！！！！！！！！
+//////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////// DELETE /////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////
+
+////////////////////// 对象删除 delete action  
 void delete_action()
 {
     int n_delete;
@@ -1359,38 +2588,21 @@ void delete_action()
 
         int size = object[id].size;
         int tag = object[id].tag;
-
+        num_tag_unit[tag - 1] -= size;
+        num_tag_object[tag - 1]--;
         // 上报需要删除的任务并更新任务状态
         int req_id = object[id].last_request_point;
 
 
-        vector<double> phase_surplus_value;
-        phase_surplus_value.resize(size);
-        //vector<int> phase_surplus_num;
-        //phase_surplus_num.resize(size);
-        int szidx = size - 1;
+
         while (!request[req_id].is_done) {
             // 更新删除后的request状态
             request[req_id].is_done = true;
-            if (!request[req_id].lose_value) {
-                int surplus_period = EXTRA_TIME - (ts - request[req_id].arrival_ts);
-                for (int j = 0; j < size; j++) {
-                    if (!request[req_id].have_read[j]) {
-                        phase_surplus_value[j] += surplus_period * request_sz_unit_value_ts_loss[szidx];
-                        //phase_surplus_num[j]++;
-                    }
-                }
-            }
-            for (int j = 0; j < MAX_OBJECT_SIZE; j++) {
-                request[req_id].have_read[j] = true;
-            }
             // 更新输出要取消的请求列表
             cancel_req_number.push_back(req_id);
             need_to_cancel++;
             req_id = request[req_id].prev_id;
         }
-
-
 
         // 处理存储该object的磁盘
         for (int i = 0; i < REP_NUM; i++) {
@@ -1430,10 +2642,19 @@ void delete_action()
                 disks[rep_d].units[u].occupied = false;
                 disks[rep_d].num_spare_units++;
                 disks[rep_d].partitions[rep_p].occupied_u_number--;
+                //disks[rep_d].partitions[rep_p].occupied_tag_u_number[tag - 1]--;
                 //更新partition中未完成的request数量
                 int num_unfi_req = disks[rep_d].units[u].number_unfi_req;
-                disks[rep_d].partitions[rep_p].num_req -= num_unfi_req;
-                disks[rep_d].units[u].number_unfi_req = 0;
+                if (num_unfi_req > 0) {
+                    //disks[rep_d].partitions[rep_p].num_u_with_req--;
+                    disks[rep_d].partitions[rep_p].num_req -= num_unfi_req;
+                    disks[rep_d].units[u].number_unfi_req = 0;
+                    disks[rep_d].partitions[rep_p].num_current_tag_req[tag] -= num_unfi_req;
+                }
+                disks[rep_d].partitions[rep_p].num_tag_units[tag - 1]--;
+
+
+
             }
             // 更新partition状态
             disks[rep_d].partitions[rep_p].full = false;
@@ -1454,10 +2675,13 @@ void delete_action()
         printf("0\n");
         fflush(stdout);
     }
-
 }
 
-////////////////////// 对齐时间片 timestamp_action   处理超时request                        尚未更新为复赛版本！！！！！！！！！！！！！
+//////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////// TimeStamp ///////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////
+
+////////////////////// 对齐时间片 timestamp_action   处理urgent_request      
 void timestamp_action()
 {
     int timestamp;
@@ -1482,32 +2706,59 @@ void timestamp_action()
     if (time_pointer == EXTRA_TIME) {
         time_pointer = 0;
     }
+    urgent_loop_pt++;
+    urgent_loop_pt %= urgent_request_ts;
+    for (int i = 0; i < urgent_req_pt[urgent_loop_pt]; i++) {
+        int req_id = urgent_req_loop[urgent_loop_pt][i];
+        if (request[req_id].is_done) {
+            continue;
+        }
+        int obj_id = request[req_id].object_id;
+        if (object[obj_id].is_urgent) {
+            continue;
+        }
+        object[obj_id].is_urgent = true;
+        urgent_obj_list[urgent_obj_list_pt] = obj_id;
+        urgent_obj_list_pt++;
+        for (int r = 0; r < REP_NUM; r++) {
+            int d = object[obj_id].replica_disk[r];
+            int p = object[obj_id].replica_partition[r];
+            disks[d].partitions[p].is_urgent = true;
+            for (int v = 0; v < object[obj_id].size; v++) {
+                if (!request[req_id].have_read[v]) {
+                    int u = object[obj_id].store_units[r][v];
+                    disks[d].units[u].is_urgent = true;
+                }
+            }
+        }
+    }
 
+    // 检查是否存在105 ts未完成的任务，若有，抛出错误
     for (int i = 0; i < loop_pointer[time_pointer]; i++) {
         int req_id = lose_value_req_loop[time_pointer][i];
         if (request[req_id].is_done) {
             continue;
         }
-        int obj_id = request[req_id].object_id;
-        request[req_id].lose_value = true;
-        int sz = request[req_id].sz;
-        sz--;
-        for (int j = 0; j <= sz; j++) {
-            if (!request[req_id].have_read[j]) {
-                for (int k = 0; k < REP_NUM; k++) {
-                    int d = object[obj_id].replica_disk[k];
-                    int p = object[obj_id].replica_partition[k];
-                    int u = object[obj_id].store_units[k][j];
-                    disks[d].units[u].number_unfi_req--;
-                    disks[d].partitions[p].num_req--;
-                }
-            }
+        else {
+            throw runtime_error("存在任务没有在105ts内上报提交");
         }
-        lose_value_req_loop[time_pointer][i] = 0;
     }
     loop_pointer[time_pointer] = 0;
 
+    // 推移记录tag在150ts内的请求总量变化值的指针
+    current_pt++;
+    current_pt %= 150;
+    last_50_pt++;
+    last_50_pt %= 150;
+    last_100_pt++;
+    last_100_pt %= 150;
+
+
 }
+
+//////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////// INITIALIZE ///////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////// 初始化函数（子函数）初始化磁盘并为tag分区 disk_partition_initialize                        
 void disk_partition_initialize() {
@@ -1580,6 +2831,18 @@ void disk_partition_initialize() {
         for (int i = 1; i <= Num_Tags; i++) {
             for (int j = 1; j <= (Total_TS - 1) / FRE_PER_SLICING + 1; j++) {
                 scanf("%d", &fre_read[i - 1][j - 1]);
+            }
+        }
+    }
+
+    // 计算tag_on_heat 
+    for (int i = 1; i <= Num_Tags; i++) {
+        for (int j = 1; j <= (Total_TS - 1) / FRE_PER_SLICING + 1; j++) {
+            if (fre_read[i - 1][j - 1] >= tag_on_heat_period_threshold) {
+                tag_on_heat[i - 1][j - 1] = true;
+            }
+            else {
+                tag_on_heat[i - 1][j - 1] = false;
             }
         }
     }
@@ -1665,6 +2928,23 @@ void disk_partition_initialize() {
     for (int i = 0; i < Num_Tags; i++) {
         tag_memory_one_part[i] = ceil(double(SZ_Disks) * (1.0 - no_tag_rate) / REP_NUM * tag_memory_rate[i]);
     }
+    int max_part_sz = 20 * max_continuous_read; // 希望一个pt可以在20个ts内读完一个part
+    vector<int> tag_part_number;
+    tag_part_number.resize(Num_Tags);
+    for (int i = 0; i < Num_Tags; i++) {
+        tag_part_number[i] = REP_NUM;
+        int slice = 1;
+        while (true) {
+            if (tag_memory_one_part[i] / slice > max_part_sz) {
+                slice++;
+            }
+            else {
+                tag_memory_one_part[i] /= slice;
+                tag_part_number[i] = slice;
+                break;
+            }
+        }
+    }
 
     //// 给出tag排列顺序
     vector<int> highest_corr_tag;
@@ -1693,7 +2973,7 @@ void disk_partition_initialize() {
     tag_allocated.resize(Num_Tags);
     tag_allocated[lowest_highest_corr_tag[Num_Tags - 1]] = true;
     tag_allocated[lowest_highest_corr_tag[Num_Tags - 2]] = true;
-    
+
     // 给出最佳tag在磁盘上的排列顺序
     int front_tag = lowest_highest_corr_tag[Num_Tags - 1];
     int sequence_pointer = 1;
@@ -1767,7 +3047,7 @@ void disk_partition_initialize() {
         }
         // 为front tag 相邻位置分配一个相关性高的
         vector<size_t> corr_sort_idx = sort_indexes(tag_req_correlation[front_tag]);
-        for (int i=0;i<Num_Tags;i++){
+        for (int i = 0; i < Num_Tags; i++) {
             if (tag_allocated[corr_sort_idx[i]]) {
                 continue;
             }
@@ -1782,7 +3062,7 @@ void disk_partition_initialize() {
             break;
         }
     }
-    
+
     // 开始在磁盘上分配分区
     vector<int> init_pt;
     init_pt.resize(Num_Disks);
@@ -1790,71 +3070,87 @@ void disk_partition_initialize() {
         init_pt[i] = 1;
     }
 
+
     for (int d = 0; d < Num_Disks; d++) {
-        for (int i = 0; i < Num_Tags; i++) {
-            int t = tag_sequence[i];
-            for (int m = 0; m < REP_NUM; m++) {
-                if (i % 2) {
-                    Partition part1 = Partition(t, tag_memory_one_part[t - 1], init_pt[d], true, false);
-                    disks[d].partitions.push_back(part1);
-                    init_pt[d] += tag_memory_one_part[t - 1];
-                }
-                else {
-                    Partition part1 = Partition(t, tag_memory_one_part[t - 1], init_pt[d], false, false);
-                    disks[d].partitions.push_back(part1);
-                    init_pt[d] += tag_memory_one_part[t - 1];
+        int first_p = 1;
+        for (int r = 0; r < REP_NUM; r++) {
+            for (int i = 0; i < Num_Tags; i++) {
+                int t = tag_sequence[i];
+                for (int m = 0; m < tag_part_number[t - 1]; m++) {
+                    first_p++;
+                    if (i % 2) {
+                        Partition part1 = Partition(t, tag_memory_one_part[t - 1], init_pt[d], true, false);
+                        disks[d].partitions.push_back(part1);
+                        init_pt[d] += tag_memory_one_part[t - 1];
+                    }
+                    else {
+                        Partition part1 = Partition(t, tag_memory_one_part[t - 1], init_pt[d], false, false);
+                        disks[d].partitions.push_back(part1);
+                        init_pt[d] += tag_memory_one_part[t - 1];
+                    }
                 }
             }
         }
     }
     // 归属replica partition 和 unit
+    num_total_tag_part = sum_vector(tag_part_number);
     for (int d = 0; d < Num_Disks; d++) {
-        for (int t = 0; t < Num_Tags; t++) {
-            vector<int> replica_disks;
-            vector<int> replica_partitions;
-            vector<vector<int>> replica_units;
-            replica_disks.resize(REP_NUM);
-            replica_partitions.resize(REP_NUM);
-            replica_units.resize(REP_NUM);
-            for (int r = 0; r < REP_NUM; r++) {
-                replica_disks[r] = (d + r) % 10;
-                replica_partitions[r] = (t * REP_NUM + r + 1);
-                replica_units[r].resize(disks[d].partitions[t * REP_NUM + r + 1].sz);
-                for (int u = 0; u < disks[d].partitions[t * REP_NUM + r + 1].sz; u++) {
-                    replica_units[r][u] = disks[d].partitions[t * REP_NUM + r + 1].first_unit + u;
+        int first_p = 1;
+        for (int i = 0; i < Num_Tags; i++) {
+            for (int m = 0; m < tag_part_number[i]; m++) {
+                vector<int> replica_disks;
+                vector<int> replica_partitions;
+                vector<vector<int>> replica_units;
+                replica_disks.resize(REP_NUM);
+                replica_partitions.resize(REP_NUM);
+                replica_units.resize(REP_NUM);
+                for (int r = 0; r < REP_NUM; r++) {
+                    replica_disks[r] = (d + r) % 10;
+                    replica_partitions[r] = (first_p + r * num_total_tag_part);
+                    replica_units[r].resize(disks[d].partitions[first_p + r * num_total_tag_part].sz);
+                    for (int u = 0; u < disks[d].partitions[first_p + r * num_total_tag_part].sz; u++) {
+                        replica_units[r][u] = disks[d].partitions[first_p + r * num_total_tag_part].first_unit + u;
+                    }
                 }
-            }
 
-            for (int r1 = 0; r1 < REP_NUM; r1++) {
-                int rep_num = 0;
-                for (int r2 = 0; r2 < REP_NUM; r2++) {
-                    if (r1 == r2) {
-                        continue;
+                for (int r1 = 0; r1 < REP_NUM; r1++) {
+                    int rep_num = 0;
+                    for (int r2 = 0; r2 < REP_NUM; r2++) {
+                        if (r1 == r2) {
+                            continue;
+                        }
+                        int d1 = replica_disks[r1];
+                        int d2 = replica_disks[r2];
+                        int p1 = replica_partitions[r1];
+                        int p2 = replica_partitions[r2];
+                        disks[d1].partitions[p1].rep_disk_id[rep_num] = d2;
+                        disks[d1].partitions[p1].rep_part_id[rep_num] = p2;
+                        for (int u = 0; u < disks[d].partitions[first_p].sz; u++) {
+                            int u1 = replica_units[r1][u];
+                            int u2 = replica_units[r2][u];
+                            disks[d1].units[u1].partition_id = p1;
+                            disks[d1].units[u1].rep_disk_id[rep_num] = d2;
+                            disks[d1].units[u1].rep_part_id[rep_num] = p2;
+                            disks[d1].units[u1].rep_unit_id[rep_num] = u2;
+                        }
+                        rep_num++;
                     }
-                    int d1 = replica_disks[r1];
-                    int d2 = replica_disks[r2];
-                    int p1 = replica_partitions[r1];
-                    int p2 = replica_partitions[r2];
-                    disks[d1].partitions[p1].rep_disk_id[rep_num] = d2;
-                    disks[d1].partitions[p1].rep_part_id[rep_num] = p2;
-                    for (int u = 0; u < disks[d].partitions[t * REP_NUM + 1].sz; u++) {
-                        int u1 = replica_units[r1][u];
-                        int u2 = replica_units[r2][u];
-                        disks[d1].units[u1].partition_id = p1;
-                        disks[d1].units[u1].rep_disk_id[rep_num] = d2;
-                        disks[d1].units[u1].rep_part_id[rep_num] = p2;
-                        disks[d1].units[u1].rep_unit_id[rep_num] = u2;
-                    }
-                    rep_num++;
                 }
+                first_p ++;
             }
         }
     }
 
 
     // 剩余内存进行无tag分区
-
+    int surplus_sz = SZ_Disks - init_pt[0];
+    int no_tag_part_sz = surplus_sz / REP_NUM;
     for (int i = 0; i < Num_Disks; i++) {
+        for (int m = 0; m < REP_NUM; m++) {
+            Partition part1 = Partition(0, no_tag_part_sz, init_pt[i], true, false);
+            disks[i].partitions.push_back(part1);
+            init_pt[i] += no_tag_part_sz;
+        }
         disks[i].partitions[0].first_unit = init_pt[i];
         disks[i].partitions[0].last_unit = SZ_Disks;
         disks[i].partitions[0].init_pointer = init_pt[i];
@@ -1867,6 +3163,90 @@ void disk_partition_initialize() {
         }
         disks[i].partitions[0].reverse_write = false;
         disks[i].partitions[0].reverse_pointer = SZ_Disks;
+    }
+
+    // 归属no tag 的 replica partition 和 unit
+    for (int d = 0; d < Num_Disks; d++) {
+        vector<int> replica_disks;
+        vector<int> replica_partitions;
+        vector<vector<int>> replica_units;
+        replica_disks.resize(REP_NUM);
+        replica_partitions.resize(REP_NUM);
+        replica_units.resize(REP_NUM);
+        for (int r = 0; r < REP_NUM; r++) {
+            replica_disks[r] = (d + r) % 10;
+            replica_partitions[r] = (disks[0].partitions.size() - 3 + r);
+            replica_units[r].resize(disks[d].partitions[disks[0].partitions.size() - 3 + r].sz);
+            for (int u = 0; u < disks[d].partitions[disks[0].partitions.size() - 3 + r].sz; u++) {
+                replica_units[r][u] = disks[d].partitions[disks[0].partitions.size() - 3 + r].first_unit + u;
+            }
+        }
+        for (int r1 = 0; r1 < REP_NUM; r1++) {
+            int rep_num = 0;
+            for (int r2 = 0; r2 < REP_NUM; r2++) {
+                if (r1 == r2) {
+                    continue;
+                }
+                int d1 = replica_disks[r1];
+                int d2 = replica_disks[r2];
+                int p1 = replica_partitions[r1];
+                int p2 = replica_partitions[r2];
+                disks[d1].partitions[p1].rep_disk_id[rep_num] = d2;
+                disks[d1].partitions[p1].rep_part_id[rep_num] = p2;
+                for (int u = 0; u < disks[d].partitions[Num_Tags * REP_NUM + 1].sz; u++) {
+                    int u1 = replica_units[r1][u];
+                    int u2 = replica_units[r2][u];
+                    disks[d1].units[u1].partition_id = p1;
+                    disks[d1].units[u1].rep_disk_id[rep_num] = d2;
+                    disks[d1].units[u1].rep_part_id[rep_num] = p2;
+                    disks[d1].units[u1].rep_unit_id[rep_num] = u2;
+                }
+                rep_num++;
+            }
+        }
+    }
+
+
+    // 归属tag_to_partition
+    tag_to_partition.resize(Num_Tags);
+    int first_p = 1;
+    for (int i = 0; i < Num_Tags / 2; i++) {
+        int t1 = tag_sequence[i * 2] - 1;
+        int t2 = tag_sequence[i * 2 + 1] - 1;
+
+        for (int m = 0; m < tag_part_number[t1]; m++) {
+            tag_to_partition[t1].partition_list.push_back(first_p + m);
+        }
+        for (int m = 0; m < tag_part_number[t2]; m++) {
+            tag_to_partition[t1].over_write_partition_list.push_back(first_p + tag_part_number[t1] + m);
+        }
+        first_p += tag_part_number[t1];
+        first_p += tag_part_number[t2];
+        for (int m = 0; m < tag_part_number[t2]; m++) {
+            tag_to_partition[t2].partition_list.push_back(first_p - m - 1);
+        }
+        for (int m = 0; m < tag_part_number[t1]; m++) {
+            tag_to_partition[t2].over_write_partition_list.push_back(first_p - tag_part_number[t2] - m - 1);
+        }
+
+    }
+
+    //预设partition Evaluator
+    for (int d = 0; d < Num_Disks; d++) {
+        int p = 1;
+        while (p < disks[d].partitions.size()) {
+            Partition_Evaluator pe1 = Partition_Evaluator(d, p);
+            partition_evaluator.push_back(pe1);
+            p += 3;
+        }
+    }
+
+    // 用来记录前24个part的激活情况
+    for (int d = 0; d < Num_Disks; d++) {
+        disks[d].part_activated.resize(num_total_tag_part + 1);
+        for (int p = 1; p <= num_total_tag_part; p++) {
+            disks[d].part_activated[p] = false;
+        }
     }
 }
 
@@ -1897,6 +3277,8 @@ void global_variable_initialize() {
             break;
         }
     }
+
+    can_read_unit_per_token = double(max_continuous_read) / Num_Tokens;
 
     //在这里计算最小pass读取
     token_left = Num_Tokens - 64 - 1 - 64 - 1 - 64 - 1 - 64;
@@ -1944,6 +3326,9 @@ void global_variable_initialize() {
     // 初始化已完成待上报的任务
     finished_requests.resize(50000);
 
+    // 初始化繁忙任务
+    busy_requests.resize(50000);
+
     // 预分配上报任务字符串内存
     output_cache.reserve(1024 * 1024 * 30);
 
@@ -1958,8 +3343,40 @@ void global_variable_initialize() {
     // 用于记录tag是否on heat
     tag_on_heat.resize(Num_Tags);
     for (int i = 0; i < Num_Tags; i++) {
-        tag_on_heat[i].resize(ceil(double(Num_Tags) / 1800));
+        tag_on_heat[i].resize(ceil(double(Total_TS) / 1800));
     }
+
+
+    // 用于记录urgent_request
+    urgent_req_loop.resize(urgent_request_ts);
+    urgent_req_pt.resize(urgent_request_ts);
+    for (int i = 0; i < urgent_request_ts; i++) {
+        urgent_req_loop[i].resize(50000);
+        urgent_req_pt[i] = 0;
+    }
+    urgent_obj_list.resize(10000);
+
+    // 用于记录tag在当前ts是否on heat，是否可以忽略请求
+    currently_tag_on_heat.resize(Num_Tags);
+    currently_tag_ignore.resize(Num_Tags);
+    currently_tag_unfi_req.resize(Num_Tags);
+    max_can_process_unit_in_time = Num_Disks * DISK_HEAD_NUM * max_continuous_read * EXTRA_TIME;
+
+    // 用来记录tag在150ts内的请求总量变化值  用于计算tag req 趋势
+    last_150_ts_tag_req.resize(Num_Tags);
+    for (int i = 0; i < Num_Tags; i++) {
+        last_150_ts_tag_req[i].resize(150);
+    }
+    avg_last_0_50_req.resize(Num_Tags);
+    avg_last_50_100_req.resize(Num_Tags);
+    avg_last_100_150_req.resize(Num_Tags);
+    current_avg_ts_req_slope.resize(Num_Tags);
+    next_105_tag_req.resize(Num_Tags);
+    next_105_tag_req_per_unit.resize(Num_Tags);
+    num_tag_unit.resize(Num_Tags);
+    num_tag_object.resize(Num_Tags);
+    tag_u_avg_req_next_105_ts.resize(Num_Tags);
+
 }
 
 ////////////////////// 初始化函数（母函数）initialize
@@ -1999,20 +3416,22 @@ int main()
     for (int t = 1; t <= Total_TS + EXTRA_TIME; t++) {
         // 固定随机种子用于调试
         srand(randseed);
-        if (request[1692].have_read[0]) {
-            int a = 1;
-        }
 
-        if (t == 737) {
-            int a = disks[2].pointer_location;
-        }
         timestamp_action(); //时间片对齐 + 处理超时的request
 
         delete_action();//对象删除
 
         write_action();//对象写入
 
+        if (ts == 156) {
+            int a = 1;
+        }
+
         read_action();//对象读取
+
+        if (t % 1800 == 0) {
+            garbage_collection_action();//回收操作
+        }
 
     }
     //clean();
